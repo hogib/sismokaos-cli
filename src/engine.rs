@@ -3,6 +3,7 @@ use npyz::Deserialize;
 use rayon::prelude::*;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::mpsc::Sender;
 
 use crate::config::AppConfig;
@@ -23,7 +24,31 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         return Err(format!("Data root not found: {:?}", config.data_root));
     }
 
-    // 1. Find all NPY files in the data root (you can expand this to read sub-folders later)
+    let _ = progress_tx.send(PipelineEvent::Warning(
+        "Running Python Preprocessor...".to_string(),
+    ));
+
+    let python_status = Command::new("python")
+        .arg("preprocess.py")
+        .arg("--mseed")
+        .arg(&config.mseed_file)
+        .arg("--out-dir")
+        .arg(&config.data_root)
+        .arg("--fs")
+        .arg(config.fs.to_string())
+        .arg("--freqmin")
+        .arg(config.freqmin.to_string())
+        .arg("--freqmax")
+        .arg(config.freqmax.to_string())
+        .arg("--gap-threshold")
+        .arg(config.gap_threshold.to_string())
+        .status()
+        .map_err(|e| format!("Failed to invoke Python: {}", e))?;
+
+    if !python_status.success() {
+        return Err("Python preprocessing failed.".to_string());
+    }
+
     let mut npy_files: Vec<PathBuf> = fs::read_dir(&config.data_root)
         .map_err(|e| e.to_string())?
         .filter_map(Result::ok)
@@ -102,7 +127,7 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
             .output_root
             .join(format!("{}_features.csv", file_stem));
 
-        if let Err(e) = crate::export::save_results(results, &file_stem, &csv_path) {
+        if let Err(e) = crate::export::save_results(results, &file_stem, &csv_path, &config) {
             let _ = progress_tx.send(PipelineEvent::Warning(format!("Failed to save CSV: {}", e)));
         }
 

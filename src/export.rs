@@ -1,3 +1,4 @@
+use crate::config::AppConfig;
 use csv::WriterBuilder;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -7,6 +8,7 @@ pub fn save_results(
     results: Vec<(usize, f64, HashMap<String, f64>)>,
     file_identifier: &str,
     output_path: &Path,
+    config: &AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if results.is_empty() {
         return Ok(());
@@ -96,5 +98,7 @@ pub fn save_results(
     }
 
     wtr.flush()?;
+    let metadata_path = output_path.with_extension("run_metadata.json");
+    config.save_to_json(&metadata_path)?;
     Ok(())
 }

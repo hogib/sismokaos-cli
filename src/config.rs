@@ -7,6 +7,7 @@ use crate::cli::Cli;
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
     pub station: String,
+    pub mseed_file: PathBuf,
     pub earthquake_name: String,
     pub raw_file_name: String,
     pub fs: f64,
@@ -37,6 +38,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             station: "ELZG".to_string(),
+            mseed_file: PathBuf::from("raw/test.mseed"),
             earthquake_name: "24012020_M6.8_Sivrice__Elazig_".to_string(),
             raw_file_name: "TU_ELZG_24012020_000000_25012020_000000_HH.mseed".to_string(),
             fs: 5.0,
@@ -83,7 +85,7 @@ impl AppConfig {
     }
 
     /// Merges CLI flags into the configuration. CLI flags take precedence.
-    pub fn merge_with_cli(&mut self, cli: &Cli) {
+    pub fn merge_with_cli(&mut self, cli: &crate::cli::Cli) {
         if let crate::cli::Commands::Run {
             mseed_file,
             out_dir,
@@ -99,29 +101,20 @@ impl AppConfig {
                 self.win_sec = *w;
             }
             if let Some(m) = mseed_file {
-                self.mseed_input_file = m.clone();
+                self.mseed_file = m.clone();
             }
             if let Some(o) = out_dir {
                 self.output_root = o.clone();
             }
         }
-        // Re-calculate derived fields in case underlying variables (like win_sec or station) changed
         self.finalize_derived_fields();
     }
 
-    /// Calculates dynamic variables, equivalent to Python's __post_init__
     fn finalize_derived_fields(&mut self) {
         let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        if self.mseed_input_file.as_os_str().is_empty() {
-            self.mseed_input_file = base_dir
-                .join("raw")
-                .join(&self.station)
-                .join(&self.earthquake_name)
-                .join(&self.raw_file_name);
-        }
-
-        self.data_root = base_dir.join("data").join(&self.earthquake_name);
+        let stem = self.mseed_file.file_stem().unwrap_or_default();
+        self.data_root = base_dir.join("data").join(stem);
 
         if self.output_root.as_os_str().is_empty() {
             self.output_root = base_dir.join("results").join(&self.station);
@@ -130,8 +123,6 @@ impl AppConfig {
         self.win_size = (self.win_sec as f64 * self.fs) as usize;
         self.step_size = (self.step_sec as f64 * self.fs) as usize;
     }
-
-    /// Saves the current configuration to a JSON file (used for the Init command)
     pub fn save_to_json<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         let json_str = serde_json::to_string_pretty(self)?;
         fs::write(path, json_str)
