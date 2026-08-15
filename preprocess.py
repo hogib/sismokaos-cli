@@ -37,7 +37,6 @@ def main():
     real_fs = st_full[0].stats.sampling_rate
     decimation_factor = max(1, int(real_fs / args.fs))
     
-    # 1. Manage Gaps & Interpolate
     gaps = st_full.get_gaps(min_gap=-1)
     actual_gaps = [g for g in gaps if g[7] > 0] if gaps else []
     large_gaps = [g for g in actual_gaps if g[6] >= args.gap_threshold]
@@ -53,7 +52,6 @@ def main():
                 data = _interpolate_nans(data, nan_mask)
             tr.data = data
 
-    # 2. Filter & Decimate
     print(f"[PYTHON] Filtering ({args.freqmin}-{args.freqmax}Hz) and Decimating...")
     st_full.detrend("demean")
     st_full.detrend("linear")
@@ -63,7 +61,6 @@ def main():
         for tr in st_full:
             tr.decimate(factor=decimation_factor, no_filter=True)
 
-    # 3. Save as Structured NPY
     args.out_dir.mkdir(parents=True, exist_ok=True)
     
     # For this script, we output a single large NPY for simplicity, 
