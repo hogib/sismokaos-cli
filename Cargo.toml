@@ -16,3 +16,9 @@ time = "0.3.55"
 
 [patch.crates-io]
 libmseed-sys = { path = "vendor/libmseed-sys" }
+
+[profile.release]
+lto = "fat"            
+codegen-units = 1      
+panic = "abort"       
+strip = true         

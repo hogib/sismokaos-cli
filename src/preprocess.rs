@@ -1,7 +1,7 @@
 use butterworth::{Cutoff, Filter};
 use mseed::{MSControlFlags, MSRecord, MSSampleType, detect};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,8 @@ const COMPONENTS: [char; 3] = ['E', 'N', 'Z'];
 struct Assembler {
     start_epoch: f64,
     fs: f64,
-    comps: HashMap<char, Vec<f64>>,
+    // Using VecDeque ensures front-drains are O(1) operations
+    comps: HashMap<char, VecDeque<f64>>,
     watermark: f64,
     context: Vec<HashMap<char, Vec<f64>>>,
     global_offset: usize,
@@ -63,7 +64,10 @@ pub fn preprocess_directory_chunked(
     let mut asm = Assembler {
         start_epoch: f64::NAN,
         fs: native_fs,
-        comps: COMPONENTS.into_iter().map(|c| (c, Vec::new())).collect(),
+        comps: COMPONENTS
+            .into_iter()
+            .map(|c| (c, VecDeque::new()))
+            .collect(),
         watermark: f64::NEG_INFINITY,
         context: Vec::new(),
         global_offset: 0,
@@ -114,7 +118,9 @@ pub fn preprocess_directory_chunked(
         if dest.len() < idx + count {
             dest.resize(idx + count, f64::NAN);
         }
-        copy_record_samples(&rec, count, &mut dest[idx..idx + count], file)?;
+        // Force the VecDeque memory to be contiguous for safe slice writing
+        let dest_slice = dest.make_contiguous();
+        copy_record_samples(&rec, count, &mut dest_slice[idx..idx + count], file)?;
 
         asm.watermark = asm
             .watermark
@@ -183,8 +189,9 @@ fn flush_block(
     let context_len = ((FILTER_CONTEXT_SECONDS * asm.fs) as usize).min(take);
     let mut next_context = HashMap::new();
     for comp in COMPONENTS {
-        let v = &asm.comps[&comp];
-        next_context.insert(comp, v[take - context_len..take].to_vec());
+        let v = asm.comps.get_mut(&comp).unwrap();
+        let slice = v.make_contiguous();
+        next_context.insert(comp, slice[take - context_len..take].to_vec());
     }
 
     let phase = (decimation_factor - (asm.global_offset % decimation_factor)) % decimation_factor;
@@ -198,7 +205,21 @@ fn flush_block(
                 let ctx = &asm.context[0][&comp];
                 combined.extend_from_slice(&ctx[ctx.len() - lead..]);
             }
-            combined.extend_from_slice(&asm.comps[&comp][..take]);
+
+            // Re-borrow as we read it into the parallel map
+            let v = &asm.comps[&comp];
+            let (slice1, slice2) = v.as_slices();
+
+            // Extract the 'take' amount of items properly from the split slices
+            let mut taken = 0;
+            let take_s1 = take.min(slice1.len());
+            combined.extend_from_slice(&slice1[..take_s1]);
+            taken += take_s1;
+
+            if taken < take {
+                let take_s2 = (take - taken).min(slice2.len());
+                combined.extend_from_slice(&slice2[..take_s2]);
+            }
 
             let processed = process_component(
                 combined,
@@ -222,7 +243,7 @@ fn flush_block(
     })?;
 
     for v in asm.comps.values_mut() {
-        v.drain(0..take);
+        v.drain(0..take); // O(1) Fast drain on VecDeque
     }
     asm.start_epoch += take as f64 / asm.fs;
     asm.global_offset += take;

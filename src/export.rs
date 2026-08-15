@@ -2,11 +2,12 @@ use crate::config::AppConfig;
 use csv::{StringRecord, Writer, WriterBuilder};
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::io::BufWriter;
 use std::path::Path;
 
 /// Writes feature rows to CSV incrementally.
 pub struct FeatureWriter {
-    writer: Writer<File>,
+    writer: Writer<BufWriter<File>>,
     feature_names: Vec<String>,
     prev_values: Option<Vec<f64>>,
     record: StringRecord, // Reusable buffer to prevent string allocations per row
@@ -26,10 +27,12 @@ impl FeatureWriter {
         feature_names.sort(); // Sort alphabetically for a consistent CSV layout
 
         let file = File::create(output_path)?;
-        let mut writer = WriterBuilder::new().from_writer(file);
+
+        // Wrap the file in a chunky 128KB buffer to drastically reduce OS system calls
+        let buffered_file = BufWriter::with_capacity(128 * 1024, file);
+        let mut writer = WriterBuilder::new().from_writer(buffered_file);
 
         // Pre-allocate the internal string buffer for the maximum expected columns
-        // (2 Base cols + Features + Feature_DEVs)
         let expected_cols = 2 + (feature_names.len() * 2);
         let mut record = StringRecord::with_capacity(1024, expected_cols);
 

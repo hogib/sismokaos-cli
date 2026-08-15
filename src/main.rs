@@ -44,6 +44,7 @@ fn main() {
 
             // Background Thread: Heavy compute (I/O, Filtering, Windowing)
             let engine_handle = thread::spawn(move || {
+                // Assuming run_pipeline is in engine.rs / pipeline.rs
                 if let Err(e) = engine::run_pipeline(engine_config, tx) {
                     eprintln!("Pipeline Error: {}", e);
                 }

@@ -1,5 +1,5 @@
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Sender, sync_channel};
 use std::thread;
 
@@ -27,9 +27,7 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         .output_root
         .join(format!("{}_features.csv", file_stem));
 
-    // Pipeline Concurrency: Use a bounded sync_channel (buffer size of 2 chunks).
-    // This allows the preprocessing thread to work on the next block while the main
-    // thread computes features for the current block, bounding memory usage.
+    // Pipeline Concurrency: Bounded channel ensures memory stays flat
     let (chunk_tx, chunk_rx) = sync_channel::<ChannelChunk>(2);
 
     let preprocess_config = config.clone();
@@ -45,9 +43,11 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         })
     });
 
-    let mut buf_e: Vec<f64> = Vec::new();
-    let mut buf_n: Vec<f64> = Vec::new();
-    let mut buf_z: Vec<f64> = Vec::new();
+    // Use VecDeque for O(1) front draining instead of Vec's O(N^2) memory shifting
+    let mut buf_e: VecDeque<f64> = VecDeque::new();
+    let mut buf_n: VecDeque<f64> = VecDeque::new();
+    let mut buf_z: VecDeque<f64> = VecDeque::new();
+
     let mut global_offset: usize = 0;
     let mut window_idx: usize = 0;
     let mut fs_out = config.fs;
@@ -70,6 +70,11 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         let mut per_window_config = config.clone();
         per_window_config.fs = fs_out;
 
+        // Ensure buffers are contiguous in memory before slicing for the Rayon iteration
+        let slice_e = buf_e.make_contiguous();
+        let slice_n = buf_n.make_contiguous();
+        let slice_z = buf_z.make_contiguous();
+
         // Data-parallel feature computation for all windows in this chunk
         let chunk_results: Vec<(f64, HashMap<String, f64>)> = starts
             .par_iter()
@@ -77,9 +82,9 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
                 let end = start + config.win_size;
                 let time_minutes = ((global_offset + end) as f64 / fs_out) / 60.0;
                 let window_features = compute_window(
-                    &buf_e[start..end],
-                    &buf_n[start..end],
-                    &buf_z[start..end],
+                    &slice_e[start..end],
+                    &slice_n[start..end],
+                    &slice_z[start..end],
                     &per_window_config,
                 );
                 (time_minutes, window_features)
@@ -106,6 +111,7 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         }
 
         if cursor > 0 {
+            // O(1) instantaneous memory pop via VecDeque
             buf_e.drain(0..cursor);
             buf_n.drain(0..cursor);
             buf_z.drain(0..cursor);
