@@ -1,16 +1,15 @@
-use std::path::PathBuf;
-
-/// Represents an event emitted by the background processing pipeline
+/// Represents an event emitted by the background processing pipeline.
+///
+/// The pipeline streams: it discovers how much data there is as it goes, so events report
+/// progress made rather than progress against a known total.
 #[derive(Debug)]
 pub enum PipelineEvent {
-    /// Started processing a new date folder
+    /// Started processing the input directory
     FolderStarted(String),
-    /// Started processing a specific file (includes total windows to process)
-    FileStarted { path: PathBuf, total_windows: usize },
-    /// Successfully computed a single window
+    /// Successfully computed and wrote a single window
     WindowProcessed,
-    /// Finished processing a file
-    FileCompleted,
+    /// All windows have been written
+    Completed,
     /// Non-fatal error or warning during processing
     Warning(String),
     /// Pipeline finished completely

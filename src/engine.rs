@@ -16,10 +16,6 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
     let _ = progress_tx.send(PipelineEvent::FolderStarted(
         config.data_dir.display().to_string(),
     ));
-    let _ = progress_tx.send(PipelineEvent::FileStarted {
-        path: config.data_dir.clone(),
-        total_windows: 0,
-    });
 
     let file_stem = config
         .data_dir
@@ -113,7 +109,7 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
             final_config.fs = fs_out;
             w.finish(&csv_path, &final_config)
                 .map_err(|e| format!("Failed to finalize output: {}", e))?;
-            let _ = progress_tx.send(PipelineEvent::FileCompleted);
+            let _ = progress_tx.send(PipelineEvent::Completed);
         }
     }
 

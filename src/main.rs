@@ -29,8 +29,6 @@ fn main() {
         }
         Commands::Run { dry_run, .. } => {
             let mut app_config = AppConfig::from_json(&cli.config);
-
-            // This now works perfectly because everything is in the same crate
             app_config.merge_with_cli(&cli);
 
             if *dry_run {
@@ -45,43 +43,36 @@ fn main() {
 
             // Spawn the processing engine in a background thread
             let engine_handle = thread::spawn(move || {
-                // We call the engine module here
                 if let Err(e) = engine::run_pipeline(engine_config, tx) {
                     eprintln!("Pipeline Error: {}", e);
                 }
             });
 
-            // Main UI thread: Listen for events and print progress
-            let mut processed_windows = 0;
-            let mut current_total_windows = 0;
+            // Main UI thread: listen for events and print progress. The total window count is
+            // not known up front (the pipeline streams, discovering the data as it reads), so
+            // report a running count refreshed in place rather than a progress bar.
+            let mut processed_windows: u64 = 0;
 
             for event in rx {
                 match event {
                     PipelineEvent::FolderStarted(folder) => {
-                        println!("\n Folder: {}", folder);
-                    }
-                    PipelineEvent::FileStarted {
-                        path,
-                        total_windows,
-                    } => {
-                        println!(" File: {:?}", path.file_name().unwrap_or_default());
-                        current_total_windows = total_windows;
-                        processed_windows = 0;
-                        print!(" Progress: [");
+                        println!(" Input: {}", folder);
                     }
                     PipelineEvent::WindowProcessed => {
                         processed_windows += 1;
-                        print!("#");
-                        let _ = std::io::stdout().flush();
+                        if processed_windows % 250 == 0 {
+                            print!("\r Windows processed: {}", processed_windows);
+                            let _ = std::io::stdout().flush();
+                        }
                     }
-                    PipelineEvent::FileCompleted => {
-                        println!("] {}/{} windows", processed_windows, current_total_windows);
+                    PipelineEvent::Completed => {
+                        println!("\r Windows processed: {}", processed_windows);
                     }
                     PipelineEvent::Warning(msg) => {
-                        println!("\n  Warning: {}", msg);
+                        println!("\r Warning: {}", msg);
                     }
                     PipelineEvent::Finished => {
-                        println!("\nAll processing finished successfully");
+                        println!("All processing finished successfully");
                     }
                 }
             }
