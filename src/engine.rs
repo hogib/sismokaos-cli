@@ -27,7 +27,6 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         .output_root
         .join(format!("{}_features.csv", file_stem));
 
-    // Pipeline Concurrency: Bounded channel ensures memory stays flat
     let (chunk_tx, chunk_rx) = sync_channel::<ChannelChunk>(2);
 
     let preprocess_config = config.clone();
@@ -43,7 +42,6 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         })
     });
 
-    // Use VecDeque for O(1) front draining instead of Vec's O(N^2) memory shifting
     let mut buf_e: VecDeque<f64> = VecDeque::new();
     let mut buf_n: VecDeque<f64> = VecDeque::new();
     let mut buf_z: VecDeque<f64> = VecDeque::new();
@@ -76,7 +74,7 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         let slice_z = buf_z.make_contiguous();
 
         // Data-parallel feature computation for all windows in this chunk
-        let chunk_results: Vec<(f64, HashMap<String, f64>)> = starts
+        let chunk_results: Vec<(f64, HashMap<&'static str, f64>)> = starts
             .par_iter()
             .map(|&start| {
                 let end = start + config.win_size;

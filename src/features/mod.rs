@@ -10,27 +10,91 @@ pub fn compute_window(
     n_seg: &[f64],
     z_seg: &[f64],
     config: &AppConfig,
-) -> HashMap<String, f64> {
+) -> HashMap<&'static str, f64> {
     let mut result = HashMap::new();
 
     // Cross-channel features
     result.insert(
-        "EN_CROSS_CORR".to_string(),
+        "EN_CROSS_CORR",
         cross::compute_cross_correlation(e_seg, n_seg),
     );
     result.insert(
-        "EZ_CROSS_CORR".to_string(),
+        "EZ_CROSS_CORR",
         cross::compute_cross_correlation(e_seg, z_seg),
     );
     result.insert(
-        "NZ_CROSS_CORR".to_string(),
+        "NZ_CROSS_CORR",
         cross::compute_cross_correlation(n_seg, z_seg),
     );
 
-    let components = [("E", e_seg), ("N", n_seg), ("Z", z_seg)];
-    let win_size_f = config.win_size as f64;
+    // Map component letters to their static key prefixes to avoid formatting
+    let components = [
+        (
+            e_seg,
+            [
+                "E_STA_LTA_Max",
+                "E_STA_LTA_Mean",
+                "E_STA_LTA_Median",
+                "E_PEAK",
+                "E_RMS",
+                "E_SKEWNESS",
+                "E_KURTOSIS",
+                "E_ZCR",
+                "E_DOMINANT_FREQ",
+                "E_SPECTRAL_CENTROID",
+                "E_LOW_FREQ_ENERGY",
+                "E_HIGH_FREQ_ENERGY",
+                "E_HJORTH_ACTIVITY",
+                "E_HJORTH_MOBILITY",
+                "E_HJORTH_COMPLEXITY",
+                "E_PERMUTATION_ENTROPY",
+            ],
+        ),
+        (
+            n_seg,
+            [
+                "N_STA_LTA_Max",
+                "N_STA_LTA_Mean",
+                "N_STA_LTA_Median",
+                "N_PEAK",
+                "N_RMS",
+                "N_SKEWNESS",
+                "N_KURTOSIS",
+                "N_ZCR",
+                "N_DOMINANT_FREQ",
+                "N_SPECTRAL_CENTROID",
+                "N_LOW_FREQ_ENERGY",
+                "N_HIGH_FREQ_ENERGY",
+                "N_HJORTH_ACTIVITY",
+                "N_HJORTH_MOBILITY",
+                "N_HJORTH_COMPLEXITY",
+                "N_PERMUTATION_ENTROPY",
+            ],
+        ),
+        (
+            z_seg,
+            [
+                "Z_STA_LTA_Max",
+                "Z_STA_LTA_Mean",
+                "Z_STA_LTA_Median",
+                "Z_PEAK",
+                "Z_RMS",
+                "Z_SKEWNESS",
+                "Z_KURTOSIS",
+                "Z_ZCR",
+                "Z_DOMINANT_FREQ",
+                "Z_SPECTRAL_CENTROID",
+                "Z_LOW_FREQ_ENERGY",
+                "Z_HIGH_FREQ_ENERGY",
+                "Z_HJORTH_ACTIVITY",
+                "Z_HJORTH_MOBILITY",
+                "Z_HJORTH_COMPLEXITY",
+                "Z_PERMUTATION_ENTROPY",
+            ],
+        ),
+    ];
 
-    // Set up FFT planner (we only need the positive frequencies up to Nyquist)
+    let win_size_f = config.win_size as f64;
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(config.win_size);
     let num_freqs = config.win_size / 2 + 1;
@@ -38,28 +102,36 @@ pub fn compute_window(
         .map(|i| i as f64 * config.fs / config.win_size as f64)
         .collect();
 
-    for (comp, seg) in components {
-        // Base case: NaNs for everything
+    for (seg, keys) in components {
         if seg.iter().any(|&x| x.is_nan()) {
             continue;
         }
 
-        // Standardize the segment for STA/LTA and FFT
-        let mean = seg.iter().sum::<f64>() / win_size_f;
-        let variance = seg.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (win_size_f - 1.0);
-        let std_dev = variance.sqrt();
+        let (mean, var, m3, m4) = math::compute_moments(seg);
+        let std_dev = var.sqrt();
+        let skewness = if var > 0.0 {
+            m3 / var.powf(1.5)
+        } else {
+            f64::NAN
+        };
+        let kurtosis = if var > 0.0 {
+            m4 / (var * var)
+        } else {
+            f64::NAN
+        };
 
-        let seg_norm: Vec<f64> = if std_dev != 0.0 {
+        let seg_norm: Vec<f64> = if std_dev > 0.0 {
             seg.iter().map(|&x| (x - mean) / std_dev).collect()
         } else {
             seg.to_vec()
         };
 
-        // Compute FFT & Power Spectrum
+        // --- Compute FFT & Power Spectrum ---
         let mut buffer: Vec<Complex<f64>> = seg_norm
             .iter()
             .map(|&x| Complex { re: x, im: 0.0 })
             .collect();
+
         fft.process(&mut buffer);
         let power_spectrum: Vec<f64> = buffer
             .iter()
@@ -73,34 +145,30 @@ pub fn compute_window(
             (config.sta_sec * config.fs) as usize,
             config.lta_sec as usize * config.fs as usize,
         );
-        result.insert(format!("{}_STA_LTA_Max", comp), sta_max);
-        result.insert(format!("{}_STA_LTA_Mean", comp), sta_mean);
-        result.insert(format!("{}_STA_LTA_Median", comp), sta_median);
-
-        result.insert(format!("{}_PEAK", comp), math::peak(seg));
-        result.insert(format!("{}_RMS", comp), math::compute_rms(seg));
-        result.insert(format!("{}_SKEWNESS", comp), math::compute_skewness(seg));
-        result.insert(format!("{}_KURTOSIS", comp), math::compute_kurtosis(seg));
-        result.insert(format!("{}_ZCR", comp), math::compute_zcr(seg));
 
         let dom_freq = math::dominant_frequency(&power_spectrum, &freqs);
-        result.insert(format!("{}_DOMINANT_FREQ", comp), dom_freq);
-
         let (centroid, lf_e, hf_e) =
             math::spectral_centroid_and_energy(&freqs, &power_spectrum, 1.0);
-        result.insert(format!("{}_SPECTRAL_CENTROID", comp), centroid);
-        result.insert(format!("{}_LOW_FREQ_ENERGY", comp), lf_e);
-        result.insert(format!("{}_HIGH_FREQ_ENERGY", comp), hf_e);
-
         let (act, mob, cx) = math::compute_hjorth_parameters(seg);
-        result.insert(format!("{}_HJORTH_ACTIVITY", comp), act);
-        result.insert(format!("{}_HJORTH_MOBILITY", comp), mob);
-        result.insert(format!("{}_HJORTH_COMPLEXITY", comp), cx);
+        let entropy = math::compute_permutation_entropy(seg);
 
-        result.insert(
-            format!("{}_PERMUTATION_ENTROPY", comp),
-            math::compute_permutation_entropy(seg),
-        );
+        // Map computed values to their static string keys
+        result.insert(keys[0], sta_max);
+        result.insert(keys[1], sta_mean);
+        result.insert(keys[2], sta_median);
+        result.insert(keys[3], math::peak(seg));
+        result.insert(keys[4], math::compute_rms(seg));
+        result.insert(keys[5], skewness);
+        result.insert(keys[6], kurtosis);
+        result.insert(keys[7], math::compute_zcr(seg));
+        result.insert(keys[8], dom_freq);
+        result.insert(keys[9], centroid);
+        result.insert(keys[10], lf_e);
+        result.insert(keys[11], hf_e);
+        result.insert(keys[12], act);
+        result.insert(keys[13], mob);
+        result.insert(keys[14], cx);
+        result.insert(keys[15], entropy);
     }
 
     result

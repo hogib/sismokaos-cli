@@ -1,17 +1,4 @@
-use std::collections::HashMap;
-
-/// Helper function to calculate variance
-fn variance(data: &[f64]) -> f64 {
-    if data.is_empty() {
-        return f64::NAN;
-    }
-    let n = data.len() as f64;
-    let mean = data.iter().sum::<f64>() / n;
-    data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n
-}
-
-/// Helper function to calculate moments (mean, variance, skewness num, kurtosis num)
-fn compute_moments(segment: &[f64]) -> (f64, f64, f64, f64) {
+pub fn compute_moments(segment: &[f64]) -> (f64, f64, f64, f64) {
     let n = segment.len() as f64;
     let mean = segment.iter().sum::<f64>() / n;
 
@@ -47,39 +34,14 @@ pub fn compute_rms(segment: &[f64]) -> f64 {
     mean_sq.sqrt()
 }
 
-pub fn compute_skewness(segment: &[f64]) -> f64 {
-    if segment.len() < 3 {
-        return f64::NAN;
-    }
-    let (_, var, m3, _) = compute_moments(segment);
-    if var == 0.0 {
-        return f64::NAN;
-    }
-    m3 / var.powf(1.5)
-}
-
-pub fn compute_kurtosis(segment: &[f64]) -> f64 {
-    if segment.len() < 4 {
-        return f64::NAN;
-    }
-    let (_, var, _, m4) = compute_moments(segment);
-    if var == 0.0 {
-        return f64::NAN;
-    }
-    m4 / (var * var)
-}
-
 pub fn compute_zcr(segment: &[f64]) -> f64 {
     if segment.len() < 2 {
         return f64::NAN;
     }
+    // Branchless optimization: >= 0.0 check avoids float multiplication and signum branches
     let crossings = segment
         .windows(2)
-        .filter(|w| {
-            let s1 = if w[0] == 0.0 { 1.0 } else { w[0].signum() };
-            let s2 = if w[1] == 0.0 { 1.0 } else { w[1].signum() };
-            s1 != s2
-        })
+        .filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0))
         .count();
 
     crossings as f64 / (segment.len() - 1) as f64
@@ -90,22 +52,27 @@ pub fn compute_sta_lta(segment: &[f64], nsta: usize, nlta: usize) -> (f64, f64, 
         return (f64::NAN, f64::NAN, f64::NAN);
     }
 
-    let data_sq: Vec<f64> = segment.iter().map(|&x| x * x).collect();
     let mut cft_valid = Vec::with_capacity(segment.len() - nlta + 1);
 
-    let mut lta_sum: f64 = data_sq[0..nlta].iter().sum();
-    let mut sta_sum: f64 = data_sq[(nlta - nsta)..nlta].iter().sum();
+    // Compute initial sums without allocating a squared data array
+    let mut lta_sum: f64 = segment[0..nlta].iter().map(|&x| x * x).sum();
+    let mut sta_sum: f64 = segment[(nlta - nsta)..nlta].iter().map(|&x| x * x).sum();
 
     cft_valid.push((sta_sum / nsta as f64) / (lta_sum / nlta as f64));
 
+    // Sliding window sum updates
     for i in nlta..segment.len() {
-        lta_sum += data_sq[i] - data_sq[i - nlta];
-        sta_sum += data_sq[i] - data_sq[i - nsta];
+        let new_sq = segment[i] * segment[i];
+        let old_lta_sq = segment[i - nlta] * segment[i - nlta];
+        let old_sta_sq = segment[i - nsta] * segment[i - nsta];
+
+        lta_sum += new_sq - old_lta_sq;
+        sta_sum += new_sq - old_sta_sq;
 
         let sta = sta_sum / nsta as f64;
         let lta = lta_sum / nlta as f64;
 
-        let ratio = if lta == 0.0 { 0.0 } else { sta / lta };
+        let ratio = if lta <= f64::EPSILON { 0.0 } else { sta / lta };
         cft_valid.push(ratio);
     }
 
@@ -116,14 +83,23 @@ pub fn compute_sta_lta(segment: &[f64], nsta: usize, nlta: usize) -> (f64, f64, 
         .unwrap_or(f64::NAN);
     let mean = cft_valid.iter().sum::<f64>() / cft_valid.len() as f64;
 
-    cft_valid.sort_by(f64::total_cmp);
-    let median = if cft_valid.len() % 2 == 0 {
-        (cft_valid[cft_valid.len() / 2 - 1] + cft_valid[cft_valid.len() / 2]) / 2.0
+    // O(N) Median Selection
+    let mid = cft_valid.len() / 2;
+    let (_, &mut median, _) = cft_valid.select_nth_unstable_by(mid, f64::total_cmp);
+
+    // Average the middle two for mathematically perfect medians on even arrays
+    let final_median = if cft_valid.len() % 2 == 0 {
+        let max_left = cft_valid[..mid]
+            .iter()
+            .copied()
+            .max_by(f64::total_cmp)
+            .unwrap_or(median);
+        (median + max_left) / 2.0
     } else {
-        cft_valid[cft_valid.len() / 2]
+        median
     };
 
-    (max, mean, median)
+    (max, mean, final_median)
 }
 
 pub fn dominant_frequency(power_spectrum: &[f64], freqs: &[f64]) -> f64 {
@@ -148,28 +124,24 @@ pub fn spectral_centroid_and_energy(
         return (0.0, 0.0, 0.0);
     }
 
-    let centroid = freqs
-        .iter()
-        .zip(power_spectrum.iter())
-        .map(|(&f, &p)| f * p)
-        .sum::<f64>()
-        / total_power;
-    let lf_energy = freqs
-        .iter()
-        .zip(power_spectrum.iter())
-        .filter(|&(&f, _)| f <= lf_hf_cutoff)
-        .map(|(_, &p)| p)
-        .sum::<f64>()
-        / total_power;
-    let hf_energy = freqs
-        .iter()
-        .zip(power_spectrum.iter())
-        .filter(|&(&f, _)| f > lf_hf_cutoff)
-        .map(|(_, &p)| p)
-        .sum::<f64>()
-        / total_power;
+    let mut centroid_sum = 0.0;
+    let mut lf_energy = 0.0;
+    let mut hf_energy = 0.0;
 
-    (centroid, lf_energy, hf_energy)
+    for (&f, &p) in freqs.iter().zip(power_spectrum.iter()) {
+        centroid_sum += f * p;
+        if f <= lf_hf_cutoff {
+            lf_energy += p;
+        } else {
+            hf_energy += p;
+        }
+    }
+
+    (
+        centroid_sum / total_power,
+        lf_energy / total_power,
+        hf_energy / total_power,
+    )
 }
 
 pub fn compute_hjorth_parameters(segment: &[f64]) -> (f64, f64, f64) {
@@ -177,42 +149,93 @@ pub fn compute_hjorth_parameters(segment: &[f64]) -> (f64, f64, f64) {
         return (f64::NAN, f64::NAN, f64::NAN);
     }
 
-    let var_x = variance(segment);
-    let x_prime: Vec<f64> = segment.windows(2).map(|w| w[1] - w[0]).collect();
-    let var_x_prime = variance(&x_prime);
-    let x_bis: Vec<f64> = x_prime.windows(2).map(|w| w[1] - w[0]).collect();
-    let var_x_bis = variance(&x_bis);
+    // Dynamic variance calculation without allocating diff arrays
+    let n = segment.len() as f64;
+    let n1 = (segment.len() - 1) as f64;
+    let n2 = (segment.len() - 2) as f64;
+
+    let mut sum_x = 0.0;
+    let mut sum_x2 = 0.0;
+    let mut sum_dx = 0.0;
+    let mut sum_dx2 = 0.0;
+    let mut sum_ddx = 0.0;
+    let mut sum_ddx2 = 0.0;
+
+    let mut prev_x = segment[0];
+    let mut prev_dx = segment[1] - segment[0];
+
+    sum_x += prev_x;
+    sum_x2 += prev_x * prev_x;
+    sum_dx += prev_dx;
+    sum_dx2 += prev_dx * prev_dx;
+
+    for &x in &segment[2..] {
+        let dx = x - prev_x;
+        let ddx = dx - prev_dx;
+
+        sum_x += x;
+        sum_x2 += x * x;
+        sum_dx += dx;
+        sum_dx2 += dx * dx;
+        sum_ddx += ddx;
+        sum_ddx2 += ddx * ddx;
+
+        prev_x = x;
+        prev_dx = dx;
+    }
+    sum_x += segment[1];
+    sum_x2 += segment[1] * segment[1]; // catch the skipped element
+
+    // var = (Sum(X^2) - (Sum(X)^2 / N)) / N
+    let var_x = (sum_x2 - (sum_x * sum_x) / n) / n;
+    let var_x_prime = (sum_dx2 - (sum_dx * sum_dx) / n1) / n1;
+    let var_x_bis = (sum_ddx2 - (sum_ddx * sum_ddx) / n2) / n2;
 
     let activity = var_x;
-    let mobility = if var_x != 0.0 {
+    let mobility = if var_x > 0.0 {
         (var_x_prime / var_x).sqrt()
     } else {
         0.0
     };
-    let complexity = if var_x_prime == 0.0 || mobility == 0.0 {
-        0.0
-    } else {
+    let complexity = if var_x_prime > 0.0 && mobility > 0.0 {
         ((var_x_bis / var_x_prime).sqrt()) / mobility
+    } else {
+        0.0
     };
 
     (activity, mobility, complexity)
 }
 
 pub fn compute_permutation_entropy(segment: &[f64]) -> f64 {
-    let d = 3;
-    let tau = 1;
-    if segment.len() < d * tau {
+    if segment.len() < 3 {
         return f64::NAN;
     }
 
-    let mut counts: HashMap<Vec<usize>, usize> = HashMap::new();
+    let mut counts = [0_usize; 6];
     let mut total_windows = 0;
 
-    for window in segment.windows(d) {
-        let mut indexed_window: Vec<(usize, f64)> = window.iter().copied().enumerate().collect();
-        indexed_window.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let permutation: Vec<usize> = indexed_window.into_iter().map(|(i, _)| i).collect();
-        *counts.entry(permutation).or_insert(0) += 1;
+    for w in segment.windows(3) {
+        let (a, b, c) = (w[0], w[1], w[2]);
+
+        let idx = if a <= b {
+            if b <= c {
+                0
+            } else if a <= c {
+                1
+            } else {
+                4
+            }
+        } else {
+            if a <= c {
+                2
+            } else if b <= c {
+                3
+            } else {
+                5
+            }
+        };
+
+        counts[idx] += 1;
         total_windows += 1;
     }
 
@@ -220,9 +243,9 @@ pub fn compute_permutation_entropy(segment: &[f64]) -> f64 {
     let mut shannon_entropy = 0.0;
     let total = total_windows as f64;
 
-    for &count in counts.values() {
-        let p = count as f64 / total;
-        if p > 0.0 {
+    for &count in &counts {
+        if count > 0 {
+            let p = count as f64 / total;
             shannon_entropy -= p * p.ln();
         }
     }

@@ -41,19 +41,15 @@ fn main() {
 
             println!("=== STARTING PIPELINE ===");
 
-            // Unbounded channel is perfect here because UI prints take virtually zero time
             let (tx, rx) = mpsc::channel();
             let engine_config = app_config.clone();
 
-            // Background Thread: Heavy compute (I/O, Filtering, Windowing)
             let engine_handle = thread::spawn(move || {
-                // Assuming run_pipeline is in engine.rs / pipeline.rs
                 if let Err(e) = engine::run_pipeline(engine_config, tx) {
                     eprintln!("Pipeline Error: {}", e);
                 }
             });
 
-            // Main Thread: Asynchronous UI consumption
             let mut processed_windows: u64 = 0;
 
             for event in rx {

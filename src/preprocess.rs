@@ -24,7 +24,6 @@ const COMPONENTS: [char; 3] = ['E', 'N', 'Z'];
 struct Assembler {
     start_epoch: f64,
     fs: f64,
-    // Using VecDeque ensures front-drains are O(1) operations
     comps: HashMap<char, VecDeque<f64>>,
     watermark: f64,
     context: Vec<HashMap<char, Vec<f64>>>,
@@ -206,11 +205,9 @@ fn flush_block(
                 combined.extend_from_slice(&ctx[ctx.len() - lead..]);
             }
 
-            // Re-borrow as we read it into the parallel map
             let v = &asm.comps[&comp];
             let (slice1, slice2) = v.as_slices();
 
-            // Extract the 'take' amount of items properly from the split slices
             let mut taken = 0;
             let take_s1 = take.min(slice1.len());
             combined.extend_from_slice(&slice1[..take_s1]);

@@ -4,8 +4,15 @@ pub fn compute_cross_correlation(segment_1: &[f64], segment_2: &[f64]) -> f64 {
     }
 
     let n = segment_1.len() as f64;
-    let mean1 = segment_1.iter().sum::<f64>() / n;
-    let mean2 = segment_2.iter().sum::<f64>() / n;
+
+    // Combining sums in one zip pass helps caching/vectorization slightly
+    let (sum1, sum2) = segment_1
+        .iter()
+        .zip(segment_2.iter())
+        .fold((0.0, 0.0), |(s1, s2), (&x, &y)| (s1 + x, s2 + y));
+
+    let mean1 = sum1 / n;
+    let mean2 = sum2 / n;
 
     let mut cov = 0.0;
     let mut var1 = 0.0;
