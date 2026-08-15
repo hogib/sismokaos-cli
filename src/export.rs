@@ -1,104 +1,100 @@
 use crate::config::AppConfig;
-use csv::WriterBuilder;
+use csv::{Writer, WriterBuilder};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::Path;
 
-pub fn save_results(
-    results: Vec<(usize, f64, HashMap<String, f64>)>,
-    file_identifier: &str,
-    output_path: &Path,
-    config: &AppConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if results.is_empty() {
-        return Ok(());
-    }
+/// Writes feature rows to CSV incrementally.
+///
+/// Rows are streamed straight to disk as they are computed rather than being buffered up for the
+/// whole run, so memory stays flat regardless of how many windows the directory produces. The
+/// `_DEV` (first-difference) columns only need the immediately preceding row, so just that one
+/// row of values is retained between writes.
+pub struct FeatureWriter {
+    writer: Writer<File>,
+    feature_names: Vec<String>,
+    prev_values: Option<Vec<f64>>,
+    rows_written: usize,
+}
 
-    // Ensure the output directory exists
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Pivot the row-based results into column-based vectors for easy math
-    let mut window_ids = Vec::with_capacity(results.len());
-    let mut times = Vec::with_capacity(results.len());
-    let mut columns: HashMap<String, Vec<f64>> = HashMap::new();
-
-    // Setup empty vectors for every feature key found in the first window
-    let first_features = &results[0].2;
-    let mut feature_names: Vec<String> = first_features.keys().cloned().collect();
-    feature_names.sort(); // Sort alphabetically for a consistent CSV layout
-
-    for name in &feature_names {
-        columns.insert(name.clone(), Vec::with_capacity(results.len()));
-    }
-
-    // Populate the vectors
-    for (w_idx, time_min, features) in results {
-        window_ids.push(format!("{}_w{:02}", file_identifier, w_idx + 1));
-        times.push(time_min);
-        for name in &feature_names {
-            let val = features.get(name).copied().unwrap_or(f64::NAN);
-            columns.get_mut(name).unwrap().push(val);
-        }
-    }
-
-    // Calculate the derivatives
-    let mut diff_columns: HashMap<String, Vec<f64>> = HashMap::new();
-    for name in &feature_names {
-        let vals = &columns[name];
-        let mut diffs = Vec::with_capacity(vals.len());
-
-        diffs.push(f64::NAN); // First row has no previous row to subtract from
-        for i in 1..vals.len() {
-            diffs.push(vals[i] - vals[i - 1]);
-        }
-        diff_columns.insert(format!("{}_DEV", name), diffs);
-    }
-
-    // Write to CSV
-    let file = File::create(output_path)?;
-    let mut wtr = WriterBuilder::new().from_writer(file);
-
-    // Build and write the header row
-    let mut header = vec!["Pencere_ID".to_string(), "Zaman_Dk".to_string()];
-    for name in &feature_names {
-        header.push(name.clone());
-    }
-    for name in &feature_names {
-        header.push(format!("{}_DEV", name));
-    }
-    wtr.write_record(&header)?;
-
-    // Build and write the data rows
-    for i in 0..window_ids.len() {
-        let mut row = vec![window_ids[i].clone(), format!("{:.6}", times[i])];
-
-        // Write base features
-        for name in &feature_names {
-            let val = columns[name][i];
-            row.push(if val.is_nan() {
-                "".to_string()
-            } else {
-                format!("{:.6}", val)
-            });
+impl FeatureWriter {
+    /// Creates the output file and writes the header, derived from the first window's feature set.
+    pub fn new(
+        output_path: &Path,
+        first_features: &HashMap<String, f64>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
         }
 
-        // Write derivative features
-        for name in &feature_names {
-            let val = diff_columns[&format!("{}_DEV", name)][i];
-            row.push(if val.is_nan() {
-                "".to_string()
-            } else {
-                format!("{:.6}", val)
-            });
-        }
+        let mut feature_names: Vec<String> = first_features.keys().cloned().collect();
+        feature_names.sort(); // Sort alphabetically for a consistent CSV layout
 
-        wtr.write_record(&row)?;
+        let file = File::create(output_path)?;
+        let mut writer = WriterBuilder::new().from_writer(file);
+
+        let mut header = vec!["Pencere_ID".to_string(), "Zaman_Dk".to_string()];
+        header.extend(feature_names.iter().cloned());
+        header.extend(feature_names.iter().map(|n| format!("{}_DEV", n)));
+        writer.write_record(&header)?;
+
+        Ok(Self {
+            writer,
+            feature_names,
+            prev_values: None,
+            rows_written: 0,
+        })
     }
 
-    wtr.flush()?;
-    let metadata_path = output_path.with_extension("run_metadata.json");
-    config.save_to_json(&metadata_path)?;
-    Ok(())
+    pub fn write_window(
+        &mut self,
+        window_id: &str,
+        time_min: f64,
+        features: &HashMap<String, f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let values: Vec<f64> = self
+            .feature_names
+            .iter()
+            .map(|name| features.get(name).copied().unwrap_or(f64::NAN))
+            .collect();
+
+        let mut row = vec![window_id.to_string(), format!("{:.6}", time_min)];
+        row.extend(values.iter().map(|&v| format_value(v)));
+
+        // The first row has no predecessor, so its derivatives are blank.
+        match &self.prev_values {
+            Some(prev) => row.extend(
+                values
+                    .iter()
+                    .zip(prev.iter())
+                    .map(|(&v, &p)| format_value(v - p)),
+            ),
+            None => row.extend(self.feature_names.iter().map(|_| String::new())),
+        }
+
+        self.writer.write_record(&row)?;
+        self.prev_values = Some(values);
+        self.rows_written += 1;
+        Ok(())
+    }
+
+    /// Flushes the CSV and writes the run metadata sidecar next to it.
+    pub fn finish(
+        mut self,
+        output_path: &Path,
+        config: &AppConfig,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        self.writer.flush()?;
+        let metadata_path = output_path.with_extension("run_metadata.json");
+        config.save_to_json(&metadata_path)?;
+        Ok(self.rows_written)
+    }
+}
+
+fn format_value(v: f64) -> String {
+    if v.is_nan() {
+        String::new()
+    } else {
+        format!("{:.6}", v)
+    }
 }

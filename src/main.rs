@@ -3,6 +3,7 @@ mod config;
 mod engine;
 mod export;
 mod features;
+mod preprocess;
 mod types;
 
 use clap::Parser;

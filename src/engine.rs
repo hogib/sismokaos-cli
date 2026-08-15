@@ -1,138 +1,120 @@
-#![allow(non_snake_case)]
-use npyz::Deserialize;
 use rayon::prelude::*;
-use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 
 use crate::config::AppConfig;
+use crate::export::FeatureWriter;
 use crate::features::compute_window;
+use crate::preprocess::{self, ChannelChunk};
 use crate::types::PipelineEvent;
 
-// Matches the structured array dtype outputted by the Python preprocessor
-#[derive(Deserialize, Debug, Clone, Copy)]
-#[allow(non_snake_case)]
-struct EnzRecord {
-    E: f64,
-    N: f64,
-    Z: f64,
-}
-
 pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Result<(), String> {
-    if !config.data_root.exists() {
-        return Err(format!("Data root not found: {:?}", config.data_root));
+    if !config.data_dir.exists() {
+        return Err(format!("Data directory not found: {:?}", config.data_dir));
     }
 
-    let _ = progress_tx.send(PipelineEvent::Warning(
-        "Running Python Preprocessor...".to_string(),
+    let _ = progress_tx.send(PipelineEvent::FolderStarted(
+        config.data_dir.display().to_string(),
     ));
+    let _ = progress_tx.send(PipelineEvent::FileStarted {
+        path: config.data_dir.clone(),
+        total_windows: 0,
+    });
 
-    let python_status = Command::new("python")
-        .arg("preprocess.py")
-        .arg("--mseed")
-        .arg(&config.mseed_file)
-        .arg("--out-dir")
-        .arg(&config.data_root)
-        .arg("--fs")
-        .arg(config.fs.to_string())
-        .arg("--freqmin")
-        .arg(config.freqmin.to_string())
-        .arg("--freqmax")
-        .arg(config.freqmax.to_string())
-        .arg("--gap-threshold")
-        .arg(config.gap_threshold.to_string())
-        .status()
-        .map_err(|e| format!("Failed to invoke Python: {}", e))?;
+    let file_stem = config
+        .data_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output".to_string());
+    let csv_path = config
+        .output_root
+        .join(format!("{}_features.csv", file_stem));
 
-    if !python_status.success() {
-        return Err("Python preprocessing failed.".to_string());
-    }
+    // Rolling buffers: preprocessing hands us the directory one file at a time, and windows are
+    // extracted as soon as enough samples accumulate, then written straight to CSV. Only the
+    // not-yet-windowed tail (< win_size samples) and one chunk's worth of feature rows are ever
+    // held at once, so memory stays flat no matter how long the recording is.
+    let mut buf_e: Vec<f64> = Vec::new();
+    let mut buf_n: Vec<f64> = Vec::new();
+    let mut buf_z: Vec<f64> = Vec::new();
+    let mut global_offset: usize = 0;
+    let mut window_idx: usize = 0;
+    let mut fs_out = config.fs;
+    let mut writer: Option<FeatureWriter> = None;
 
-    let mut npy_files: Vec<PathBuf> = fs::read_dir(&config.data_root)
-        .map_err(|e| e.to_string())?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "npy"))
-        .collect();
+    preprocess::preprocess_directory_chunked(&config.data_dir, &config, |chunk: ChannelChunk| {
+        fs_out = chunk.fs;
+        buf_e.extend(chunk.e);
+        buf_n.extend(chunk.n);
+        buf_z.extend(chunk.z);
 
-    npy_files.sort();
-
-    for path in npy_files {
-        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
-
-        // 2. Read the structured NPY file
-        let bytes = fs::read(&path).map_err(|e| format!("Failed to read file: {}", e))?;
-        let reader =
-            npyz::NpyFile::new(&bytes[..]).map_err(|e| format!("NPY parse error: {}", e))?;
-        let records: Vec<EnzRecord> = reader
-            .into_vec()
-            .map_err(|e| format!("Deserialization error: {}", e))?;
-
-        // 3. Un-interleave into contiguous memory for fast slicing
-        let total_samples = records.len();
-        let mut e_data = Vec::with_capacity(total_samples);
-        let mut n_data = Vec::with_capacity(total_samples);
-        let mut z_data = Vec::with_capacity(total_samples);
-
-        for record in records {
-            e_data.push(record.E);
-            n_data.push(record.N);
-            z_data.push(record.Z);
+        let mut starts = Vec::new();
+        let mut cursor = 0usize;
+        while buf_e.len() - cursor >= config.win_size {
+            starts.push(cursor);
+            cursor += config.step_size;
         }
 
-        if total_samples < config.win_size {
-            let _ = progress_tx.send(PipelineEvent::Warning(format!(
-                "File {} too small for window size.",
-                file_name
-            )));
-            continue;
-        }
-        let total_windows = (total_samples - config.win_size) / config.step_size + 1;
-        let _ = progress_tx.send(PipelineEvent::FileStarted {
-            path: path.clone(),
-            total_windows,
-        });
+        let mut per_window_config = config.clone();
+        per_window_config.fs = fs_out;
 
-        let num_windows = (total_samples - config.win_size) / config.step_size + 1;
-        let _ = progress_tx.send(PipelineEvent::FileStarted {
-            path: path.clone(),
-            total_windows,
-        });
-
-        let results: Vec<_> = (0..num_windows)
-            .into_par_iter()
-            .map(|w_idx| {
-                let start = w_idx * config.step_size;
+        let chunk_results: Vec<(f64, HashMap<String, f64>)> = starts
+            .par_iter()
+            .map(|&start| {
                 let end = start + config.win_size;
-
-                let time_minutes = (end as f64 / config.fs) / 60.0;
-
+                let time_minutes = ((global_offset + end) as f64 / fs_out) / 60.0;
                 let window_features = compute_window(
-                    &e_data[start..end],
-                    &n_data[start..end],
-                    &z_data[start..end],
-                    &config,
+                    &buf_e[start..end],
+                    &buf_n[start..end],
+                    &buf_z[start..end],
+                    &per_window_config,
                 );
-
-                // Notify UI that a window is done (Rayon threads share this channel safely)
-                let _ = progress_tx.send(PipelineEvent::WindowProcessed);
-
-                (w_idx, time_minutes, window_features)
+                (time_minutes, window_features)
             })
             .collect();
 
-        let file_stem = path.file_stem().unwrap().to_string_lossy().to_string();
-        let csv_path = config
-            .output_root
-            .join(format!("{}_features.csv", file_stem));
+        for (time_minutes, features) in chunk_results {
+            let w = match writer.as_mut() {
+                Some(w) => w,
+                None => {
+                    let new_writer = FeatureWriter::new(&csv_path, &features)
+                        .map_err(|e| format!("Failed to create output CSV: {}", e))?;
+                    writer = Some(new_writer);
+                    writer.as_mut().unwrap()
+                }
+            };
 
-        if let Err(e) = crate::export::save_results(results, &file_stem, &csv_path, &config) {
-            let _ = progress_tx.send(PipelineEvent::Warning(format!("Failed to save CSV: {}", e)));
+            let window_id = format!("{}_w{:02}", file_stem, window_idx + 1);
+            w.write_window(&window_id, time_minutes, &features)
+                .map_err(|e| format!("Failed to write CSV row: {}", e))?;
+
+            let _ = progress_tx.send(PipelineEvent::WindowProcessed);
+            window_idx += 1;
         }
 
-        // NOTE: In Step 5, we will take `_results` and save it to CSV/Parquet!
-        let _ = progress_tx.send(PipelineEvent::FileCompleted);
+        if cursor > 0 {
+            buf_e.drain(0..cursor);
+            buf_n.drain(0..cursor);
+            buf_z.drain(0..cursor);
+            global_offset += cursor;
+        }
+
+        Ok(())
+    })?;
+
+    match writer {
+        None => {
+            let _ = progress_tx.send(PipelineEvent::Warning(
+                "Not enough data for a single window.".to_string(),
+            ));
+        }
+        Some(w) => {
+            let mut final_config = config.clone();
+            final_config.fs = fs_out;
+            w.finish(&csv_path, &final_config)
+                .map_err(|e| format!("Failed to finalize output: {}", e))?;
+            let _ = progress_tx.send(PipelineEvent::FileCompleted);
+        }
     }
 
     let _ = progress_tx.send(PipelineEvent::Finished);
