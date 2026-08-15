@@ -16,13 +16,3 @@ pub enum PipelineEvent {
     /// Pipeline finished completely
     Finished,
 }
-
-/// A single window of 3-channel data ready for feature extraction
-#[derive(Debug, Clone)]
-pub struct WindowData {
-    pub e: Vec<f64>,
-    pub n: Vec<f64>,
-    pub z: Vec<f64>,
-    pub window_id: String,
-    pub time_minutes: f64,
-}

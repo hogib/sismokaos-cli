@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 use npyz::Deserialize;
 use rayon::prelude::*;
 use std::fs;
