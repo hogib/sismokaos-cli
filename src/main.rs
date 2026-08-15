@@ -13,8 +13,11 @@ use std::thread;
 
 use cli::{Cli, Commands};
 use config::AppConfig;
+use mimalloc::MiMalloc;
 use types::PipelineEvent;
 
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 fn main() {
     let cli = Cli::parse();
 
