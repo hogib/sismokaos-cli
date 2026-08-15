@@ -63,36 +63,60 @@ impl AppConfig {
 
     /// Merges CLI flags into the configuration. CLI flags take precedence.
     pub fn merge_with_cli(&mut self, cli: &crate::cli::Cli) {
-        if let crate::cli::Commands::Run {
-            data_dir,
-            out_dir,
-            station,
-            win_sec,
-            fs,
-            freqmin,
-            freqmax,
-            ..
-        } = &cli.command
-        {
-            self.data_dir = data_dir.clone();
-            self.output_root = out_dir.clone();
+        match &cli.command {
+            crate::cli::Commands::Run {
+                data_dir,
+                out_dir,
+                station,
+                win_sec,
+                fs,
+                freqmin,
+                freqmax,
+                ..
+            } => {
+                self.data_dir = data_dir.clone();
+                self.output_root = out_dir.clone();
 
-            if let Some(s) = station {
-                self.station = s.clone();
+                if let Some(s) = station {
+                    self.station = s.clone();
+                }
+                if let Some(w) = win_sec {
+                    self.win_sec = *w;
+                }
+                if let Some(f) = fs {
+                    self.fs = *f;
+                }
+                if let Some(f) = freqmin {
+                    self.freqmin = *f;
+                }
+                if let Some(f) = freqmax {
+                    self.freqmax = *f;
+                }
             }
-            if let Some(w) = win_sec {
-                self.win_sec = *w;
+            crate::cli::Commands::Preprocess {
+                data_dir,
+                out_dir,
+                fs,
+                freqmin,
+                freqmax,
+                ..
+            } => {
+                self.data_dir = data_dir.clone();
+                self.output_root = out_dir.clone();
+
+                if let Some(f) = fs {
+                    self.fs = *f;
+                }
+                if let Some(f) = freqmin {
+                    self.freqmin = *f;
+                }
+                if let Some(f) = freqmax {
+                    self.freqmax = *f;
+                }
             }
-            if let Some(f) = fs {
-                self.fs = *f;
-            }
-            if let Some(f) = freqmin {
-                self.freqmin = *f;
-            }
-            if let Some(f) = freqmax {
-                self.freqmax = *f;
-            }
+            crate::cli::Commands::Init { .. } => {}
         }
+
         self.finalize_derived_fields();
     }
 
