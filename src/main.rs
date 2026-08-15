@@ -4,6 +4,7 @@ mod engine;
 mod export;
 mod features;
 mod preprocess;
+mod preprocess_only;
 mod types;
 
 use clap::Parser;
@@ -30,7 +31,7 @@ fn main() {
                 println!("[SUCCESS] Created default configuration at {:?}", out);
             }
         }
-        Commands::Run { dry_run, .. } => {
+        Commands::Run { dry_run, .. } | Commands::Preprocess { dry_run, .. } => {
             let mut app_config = AppConfig::from_json(&cli.config);
             app_config.merge_with_cli(&cli);
 
@@ -44,8 +45,16 @@ fn main() {
             let (tx, rx) = mpsc::channel();
             let engine_config = app_config.clone();
 
+            let run_preprocess = matches!(&cli.command, Commands::Preprocess { .. });
+
             let engine_handle = thread::spawn(move || {
-                if let Err(e) = engine::run_pipeline(engine_config, tx) {
+                let result = if run_preprocess {
+                    preprocess_only::run_preprocess_only(engine_config, tx)
+                } else {
+                    engine::run_pipeline(engine_config, tx)
+                };
+
+                if let Err(e) = result {
                     eprintln!("Pipeline Error: {}", e);
                 }
             });
