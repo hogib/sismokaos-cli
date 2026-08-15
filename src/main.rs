@@ -38,19 +38,18 @@ fn main() {
 
             println!("=== STARTING PIPELINE ===");
 
+            // Unbounded channel is perfect here because UI prints take virtually zero time
             let (tx, rx) = mpsc::channel();
             let engine_config = app_config.clone();
 
-            // Spawn the processing engine in a background thread
+            // Background Thread: Heavy compute (I/O, Filtering, Windowing)
             let engine_handle = thread::spawn(move || {
                 if let Err(e) = engine::run_pipeline(engine_config, tx) {
                     eprintln!("Pipeline Error: {}", e);
                 }
             });
 
-            // Main UI thread: listen for events and print progress. The total window count is
-            // not known up front (the pipeline streams, discovering the data as it reads), so
-            // report a running count refreshed in place rather than a progress bar.
+            // Main Thread: Asynchronous UI consumption
             let mut processed_windows: u64 = 0;
 
             for event in rx {
@@ -60,7 +59,7 @@ fn main() {
                     }
                     PipelineEvent::WindowProcessed => {
                         processed_windows += 1;
-                        if processed_windows % 250 == 0 {
+                        if processed_windows % 120 == 0 {
                             print!("\r Windows processed: {}", processed_windows);
                             let _ = std::io::stdout().flush();
                         }

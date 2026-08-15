@@ -1,24 +1,19 @@
 use crate::config::AppConfig;
-use csv::{Writer, WriterBuilder};
+use csv::{StringRecord, Writer, WriterBuilder};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::Path;
 
 /// Writes feature rows to CSV incrementally.
-///
-/// Rows are streamed straight to disk as they are computed rather than being buffered up for the
-/// whole run, so memory stays flat regardless of how many windows the directory produces. The
-/// `_DEV` (first-difference) columns only need the immediately preceding row, so just that one
-/// row of values is retained between writes.
 pub struct FeatureWriter {
     writer: Writer<File>,
     feature_names: Vec<String>,
     prev_values: Option<Vec<f64>>,
+    record: StringRecord, // Reusable buffer to prevent string allocations per row
     rows_written: usize,
 }
 
 impl FeatureWriter {
-    /// Creates the output file and writes the header, derived from the first window's feature set.
     pub fn new(
         output_path: &Path,
         first_features: &HashMap<String, f64>,
@@ -33,6 +28,11 @@ impl FeatureWriter {
         let file = File::create(output_path)?;
         let mut writer = WriterBuilder::new().from_writer(file);
 
+        // Pre-allocate the internal string buffer for the maximum expected columns
+        // (2 Base cols + Features + Feature_DEVs)
+        let expected_cols = 2 + (feature_names.len() * 2);
+        let mut record = StringRecord::with_capacity(1024, expected_cols);
+
         let mut header = vec!["Pencere_ID".to_string(), "Zaman_Dk".to_string()];
         header.extend(feature_names.iter().cloned());
         header.extend(feature_names.iter().map(|n| format!("{}_DEV", n)));
@@ -42,6 +42,7 @@ impl FeatureWriter {
             writer,
             feature_names,
             prev_values: None,
+            record,
             rows_written: 0,
         })
     }
@@ -52,28 +53,38 @@ impl FeatureWriter {
         time_min: f64,
         features: &HashMap<String, f64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let values: Vec<f64> = self
-            .feature_names
-            .iter()
-            .map(|name| features.get(name).copied().unwrap_or(f64::NAN))
-            .collect();
+        // Clear the reusable buffer instead of allocating a new Vec<String>
+        self.record.clear();
 
-        let mut row = vec![window_id.to_string(), format!("{:.6}", time_min)];
-        row.extend(values.iter().map(|&v| format_value(v)));
+        // 1. Base Info
+        self.record.push_field(window_id);
+        self.record.push_field(&format!("{:.6}", time_min));
 
-        // The first row has no predecessor, so its derivatives are blank.
-        match &self.prev_values {
-            Some(prev) => row.extend(
-                values
-                    .iter()
-                    .zip(prev.iter())
-                    .map(|(&v, &p)| format_value(v - p)),
-            ),
-            None => row.extend(self.feature_names.iter().map(|_| String::new())),
+        // 2. Features (Extract current values while pushing to the CSV buffer)
+        let mut current_values = Vec::with_capacity(self.feature_names.len());
+        for name in &self.feature_names {
+            let v = features.get(name).copied().unwrap_or(f64::NAN);
+            current_values.push(v);
+            push_formatted_value(&mut self.record, v);
         }
 
-        self.writer.write_record(&row)?;
-        self.prev_values = Some(values);
+        // 3. First-difference (_DEV) columns
+        match &self.prev_values {
+            Some(prev) => {
+                for (&v, &p) in current_values.iter().zip(prev.iter()) {
+                    push_formatted_value(&mut self.record, v - p);
+                }
+            }
+            None => {
+                // The first row has no predecessor, so its derivatives are blank.
+                for _ in 0..self.feature_names.len() {
+                    self.record.push_field("");
+                }
+            }
+        }
+
+        self.writer.write_record(&self.record)?;
+        self.prev_values = Some(current_values);
         self.rows_written += 1;
         Ok(())
     }
@@ -91,10 +102,12 @@ impl FeatureWriter {
     }
 }
 
-fn format_value(v: f64) -> String {
+/// Helper function to push directly to the CSV buffer, skipping String creation on NaNs.
+#[inline(always)]
+fn push_formatted_value(record: &mut StringRecord, v: f64) {
     if v.is_nan() {
-        String::new()
+        record.push_field("");
     } else {
-        format!("{:.6}", v)
+        record.push_field(&format!("{:.6}", v));
     }
 }

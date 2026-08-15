@@ -1,6 +1,7 @@
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, sync_channel};
+use std::thread;
 
 use crate::config::AppConfig;
 use crate::export::FeatureWriter;
@@ -26,10 +27,24 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         .output_root
         .join(format!("{}_features.csv", file_stem));
 
-    // Rolling buffers: preprocessing hands us the directory one file at a time, and windows are
-    // extracted as soon as enough samples accumulate, then written straight to CSV. Only the
-    // not-yet-windowed tail (< win_size samples) and one chunk's worth of feature rows are ever
-    // held at once, so memory stays flat no matter how long the recording is.
+    // Pipeline Concurrency: Use a bounded sync_channel (buffer size of 2 chunks).
+    // This allows the preprocessing thread to work on the next block while the main
+    // thread computes features for the current block, bounding memory usage.
+    let (chunk_tx, chunk_rx) = sync_channel::<ChannelChunk>(2);
+
+    let preprocess_config = config.clone();
+    let data_dir = config.data_dir.clone();
+
+    // Spawn the preprocessor in a background thread
+    let preprocessor_thread = thread::spawn(move || {
+        preprocess::preprocess_directory_chunked(&data_dir, &preprocess_config, |chunk| {
+            if chunk_tx.send(chunk).is_err() {
+                return Err("Pipeline channel closed unexpectedly.".to_string());
+            }
+            Ok(())
+        })
+    });
+
     let mut buf_e: Vec<f64> = Vec::new();
     let mut buf_n: Vec<f64> = Vec::new();
     let mut buf_z: Vec<f64> = Vec::new();
@@ -38,7 +53,8 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
     let mut fs_out = config.fs;
     let mut writer: Option<FeatureWriter> = None;
 
-    preprocess::preprocess_directory_chunked(&config.data_dir, &config, |chunk: ChannelChunk| {
+    // Consume chunks as they arrive asynchronously
+    for chunk in chunk_rx {
         fs_out = chunk.fs;
         buf_e.extend(chunk.e);
         buf_n.extend(chunk.n);
@@ -54,6 +70,7 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         let mut per_window_config = config.clone();
         per_window_config.fs = fs_out;
 
+        // Data-parallel feature computation for all windows in this chunk
         let chunk_results: Vec<(f64, HashMap<String, f64>)> = starts
             .par_iter()
             .map(|&start| {
@@ -94,9 +111,12 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
             buf_z.drain(0..cursor);
             global_offset += cursor;
         }
+    }
 
-        Ok(())
-    })?;
+    // Ensure preprocessor finished successfully and catch any errors it yielded
+    preprocessor_thread
+        .join()
+        .map_err(|_| "Preprocessor thread panicked".to_string())??;
 
     match writer {
         None => {

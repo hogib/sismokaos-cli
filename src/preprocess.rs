@@ -1,5 +1,6 @@
 use butterworth::{Cutoff, Filter};
-use mseed::{detect, MSControlFlags, MSRecord, MSSampleType};
+use mseed::{MSControlFlags, MSRecord, MSSampleType, detect};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -7,21 +8,10 @@ use std::path::{Path, PathBuf};
 
 use crate::config::AppConfig;
 
-/// Duration of signal processed (and emitted) at a time. Chosen to keep working memory small and
-/// independent of both file size and directory size; a whole miniSEED file is never held at once.
 const BLOCK_SECONDS: f64 = 3600.0;
-
-/// How far past a block's end the input stream must advance before that block is considered
-/// complete. Records for the three components are interleaved in a file and can be slightly out
-/// of order, so a block is only flushed once data comfortably beyond it has been seen.
 const WATERMARK_SECONDS: f64 = 60.0;
-
-/// Seconds of preceding signal fed into the bandpass filter ahead of each block, so the zero-phase
-/// filter has settled by the time it reaches samples that are actually emitted.
 const FILTER_CONTEXT_SECONDS: f64 = 120.0;
 
-/// A gap-filled, filtered and decimated block of E/N/Z channel data. Blocks arrive in time order
-/// and join seamlessly: decimation runs on a single global sample grid across the whole run.
 pub struct ChannelChunk {
     pub e: Vec<f64>,
     pub n: Vec<f64>,
@@ -31,23 +21,16 @@ pub struct ChannelChunk {
 
 const COMPONENTS: [char; 3] = ['E', 'N', 'Z'];
 
-/// Rolling assembly buffer holding the not-yet-emitted span of the signal.
 struct Assembler {
-    /// Epoch of index 0 of every component buffer.
     start_epoch: f64,
     fs: f64,
     comps: HashMap<char, Vec<f64>>,
-    /// Latest sample time seen anywhere in the input, used to decide when a block is complete.
     watermark: f64,
-    /// Native-rate samples immediately preceding `start_epoch`, to prime the filter.
     context: Vec<HashMap<char, Vec<f64>>>,
-    /// Absolute native-sample index of `start_epoch` in the global stream, so decimation stays on
-    /// one grid across block boundaries.
     global_offset: usize,
     dropped_late_records: usize,
 }
 
-/// Location and header facts for a single miniSEED record, so it can be re-read on demand.
 struct RecordRef {
     file: u32,
     offset: u64,
@@ -57,19 +40,6 @@ struct RecordRef {
     count: u32,
 }
 
-/// Reads every miniSEED file in `data_dir` and invokes `on_chunk` with successive fixed-duration
-/// blocks of demeaned, detrended, bandpass-filtered and decimated E/N/Z samples.
-///
-/// Memory is bounded by `BLOCK_SECONDS` regardless of how large any individual file is or how
-/// many files there are: neither a directory of many files nor a single enormous file is ever
-/// held in memory whole.
-///
-/// A first header-only pass indexes every record's location and start time; the index is then
-/// sorted so records can be replayed in true time order, one at a time, into a rolling buffer
-/// that is flushed and drained every block. The sort matters because miniSEED files are commonly
-/// written channel-sequentially (every E record, then every N, then every Z) rather than
-/// interleaved by time — reading such a file front to back would otherwise finish an entire
-/// component before the other two started.
 pub fn preprocess_directory_chunked(
     data_dir: &Path,
     config: &AppConfig,
@@ -135,8 +105,6 @@ pub fn preprocess_directory_chunked(
 
         let idx = ((r.start_epoch - asm.start_epoch) * native_fs).round() as i64;
         if idx < 0 {
-            // Belongs to a block that has already been emitted; nothing sensible to do with it
-            // now, so count it and carry on rather than corrupting the current block.
             asm.dropped_late_records += 1;
             continue;
         }
@@ -152,7 +120,6 @@ pub fn preprocess_directory_chunked(
             .watermark
             .max(r.start_epoch + (count as f64 - 1.0) / native_fs);
 
-        // Emit every block that the input has now moved safely past.
         while asm.watermark >= asm.start_epoch + BLOCK_SECONDS + WATERMARK_SECONDS {
             flush_block(
                 &mut asm,
@@ -165,7 +132,6 @@ pub fn preprocess_directory_chunked(
         }
     }
 
-    // Drain whatever is left once the input is exhausted.
     while asm.comps.values().any(|v| !v.is_empty()) {
         flush_block(
             &mut asm,
@@ -188,7 +154,6 @@ pub fn preprocess_directory_chunked(
     Ok(())
 }
 
-/// Emits one block from the front of the assembler and drains it from the buffers.
 fn flush_block(
     asm: &mut Assembler,
     block_len: usize,
@@ -204,19 +169,17 @@ fn flush_block(
     }
     let take = block_len.min(available);
 
-    // Square off the block: a component with no data this far along is short, so pad it out and
-    // let the NaNs mark it as missing rather than silently shifting samples.
     for v in asm.comps.values_mut() {
         if v.len() < take {
             v.resize(take, f64::NAN);
         }
     }
 
-    let lead = asm.context.first().map_or(0, |c| {
-        c.values().map(|v| v.len()).min().unwrap_or(0)
-    });
+    let lead = asm
+        .context
+        .first()
+        .map_or(0, |c| c.values().map(|v| v.len()).min().unwrap_or(0));
 
-    // Keep the tail of this block (native rate) to prime the next block's filter.
     let context_len = ((FILTER_CONTEXT_SECONDS * asm.fs) as usize).min(take);
     let mut next_context = HashMap::new();
     for comp in COMPONENTS {
@@ -224,31 +187,32 @@ fn flush_block(
         next_context.insert(comp, v[take - context_len..take].to_vec());
     }
 
-    // Decimation runs on one global grid, so the first kept sample of this block is whichever
-    // offset lands back on that grid.
     let phase = (decimation_factor - (asm.global_offset % decimation_factor)) % decimation_factor;
 
-    let mut out: HashMap<char, Vec<f64>> = HashMap::new();
-    for comp in COMPONENTS {
-        let mut combined = Vec::with_capacity(lead + take);
-        if lead > 0 {
-            let ctx = &asm.context[0][&comp];
-            combined.extend_from_slice(&ctx[ctx.len() - lead..]);
-        }
-        combined.extend_from_slice(&asm.comps[&comp][..take]);
+    // Component-level concurrency: Filter E, N, and Z concurrently
+    let processed_results: Result<Vec<(char, Vec<f64>)>, String> = COMPONENTS
+        .par_iter()
+        .map(|&comp| {
+            let mut combined = Vec::with_capacity(lead + take);
+            if lead > 0 {
+                let ctx = &asm.context[0][&comp];
+                combined.extend_from_slice(&ctx[ctx.len() - lead..]);
+            }
+            combined.extend_from_slice(&asm.comps[&comp][..take]);
 
-        out.insert(
-            comp,
-            process_component(
+            let processed = process_component(
                 combined,
                 config.freqmin,
                 config.freqmax,
                 asm.fs,
                 decimation_factor,
                 lead + phase,
-            )?,
-        );
-    }
+            )?;
+            Ok((comp, processed))
+        })
+        .collect();
+
+    let mut out: HashMap<char, Vec<f64>> = processed_results?.into_iter().collect();
 
     on_chunk(ChannelChunk {
         e: out.remove(&'E').unwrap(),
@@ -257,7 +221,6 @@ fn flush_block(
         fs: out_fs,
     })?;
 
-    // Advance past the emitted block.
     for v in asm.comps.values_mut() {
         v.drain(0..take);
     }
@@ -269,89 +232,115 @@ fn flush_block(
     Ok(())
 }
 
-/// Header-only pass over every file, recording where each record lives and what it covers.
-///
-/// Records are located by walking each file with `detect()` (which reports the record length),
-/// then parsing the header without unpacking sample data, so this stays cheap and allocates only
-/// the index itself (a few tens of bytes per record).
 fn build_index(files: &[PathBuf]) -> Result<(Vec<RecordRef>, f64), String> {
-    let mut index: Vec<RecordRef> = Vec::new();
-    let mut fs: Option<f64> = None;
-    let mut seen: Vec<char> = Vec::new();
+    // I/O Concurrency: Read headers and detect records across all files in parallel.
+    let thread_results: Result<Vec<(Vec<RecordRef>, Option<f64>, Vec<char>)>, String> = files
+        .par_iter()
+        .enumerate()
+        .map(|(file_idx, path)| {
+            let mut local_index = Vec::new();
+            let mut local_fs: Option<f64> = None;
+            let mut local_seen = Vec::new();
 
-    for (file_idx, path) in files.iter().enumerate() {
-        let mut handle =
-            File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
-        let file_len = handle
-            .metadata()
-            .map_err(|e| format!("Failed to stat {:?}: {}", path, e))?
-            .len();
+            let mut handle =
+                File::open(path).map_err(|e| format!("Failed to open {:?}: {}", path, e))?;
+            let file_len = handle
+                .metadata()
+                .map_err(|e| format!("Failed to stat {:?}: {}", path, e))?
+                .len();
 
-        let mut pos: u64 = 0;
-        let mut header = [0u8; 128];
-        let mut raw: Vec<u8> = Vec::new();
+            let mut pos: u64 = 0;
+            let mut header = [0u8; 128];
+            let mut raw: Vec<u8> = Vec::new();
 
-        while pos + 64 <= file_len {
-            let want = 128.min((file_len - pos) as usize);
-            handle
-                .seek(SeekFrom::Start(pos))
-                .map_err(|e| format!("Failed to seek in {:?}: {}", path, e))?;
-            handle
-                .read_exact(&mut header[..want])
-                .map_err(|e| format!("Failed to read header in {:?}: {}", path, e))?;
+            while pos + 64 <= file_len {
+                let want = 128.min((file_len - pos) as usize);
+                handle
+                    .seek(SeekFrom::Start(pos))
+                    .map_err(|e| format!("Failed to seek in {:?}: {}", path, e))?;
+                handle
+                    .read_exact(&mut header[..want])
+                    .map_err(|e| format!("Failed to read header in {:?}: {}", path, e))?;
 
-            let detection = detect(&header[..want])
-                .map_err(|e| format!("Not miniSEED at byte {} of {:?}: {}", pos, path, e))?;
-            let rec_len = detection.rec_len.ok_or_else(|| {
-                format!(
-                    "Indeterminate record length at byte {} of {:?}; cannot index this file",
-                    pos, path
-                )
-            })? as usize;
+                let detection = detect(&header[..want])
+                    .map_err(|e| format!("Not miniSEED at byte {} of {:?}: {}", pos, path, e))?;
+                let rec_len = detection.rec_len.ok_or_else(|| {
+                    format!(
+                        "Indeterminate record length at byte {} of {:?}; cannot index this file",
+                        pos, path
+                    )
+                })? as usize;
 
-            raw.resize(rec_len, 0u8);
-            handle
-                .seek(SeekFrom::Start(pos))
-                .map_err(|e| format!("Failed to seek in {:?}: {}", path, e))?;
-            handle
-                .read_exact(&mut raw)
-                .map_err(|e| format!("Failed to read record in {:?}: {}", path, e))?;
+                raw.resize(rec_len, 0u8);
+                handle
+                    .seek(SeekFrom::Start(pos))
+                    .map_err(|e| format!("Failed to seek in {:?}: {}", path, e))?;
+                handle
+                    .read_exact(&mut raw)
+                    .map_err(|e| format!("Failed to read record in {:?}: {}", path, e))?;
 
-            let rec = MSRecord::parse(&raw, MSControlFlags::empty())
-                .map_err(|e| format!("Failed to parse record in {:?}: {}", path, e))?;
+                let rec = MSRecord::parse(&raw, MSControlFlags::empty())
+                    .map_err(|e| format!("Failed to parse record in {:?}: {}", path, e))?;
 
-            let sid = rec.sid_lossy();
-            let rate = rec.sample_rate_hz();
-            if let Some(component) = component_of(&sid) {
-                if rate > 0.0 {
-                    if !seen.contains(&component) {
-                        seen.push(component);
-                    }
-                    match fs {
-                        None => fs = Some(rate),
-                        Some(existing) if (existing - rate).abs() > 1e-6 => {
-                            return Err(format!(
-                                "Mixed sample rates in {:?} ({} and {} Hz); not supported",
-                                path, existing, rate
-                            ));
+                let sid = rec.sid_lossy();
+                let rate = rec.sample_rate_hz();
+                if let Some(component) = component_of(&sid) {
+                    if rate > 0.0 {
+                        if !local_seen.contains(&component) {
+                            local_seen.push(component);
                         }
-                        _ => {}
+                        match local_fs {
+                            None => local_fs = Some(rate),
+                            Some(existing) if (existing - rate).abs() > 1e-6 => {
+                                return Err(format!(
+                                    "Mixed sample rates in {:?} ({} and {} Hz); not supported",
+                                    path, existing, rate
+                                ));
+                            }
+                            _ => {}
+                        }
+
+                        local_index.push(RecordRef {
+                            file: file_idx as u32,
+                            offset: pos,
+                            len: rec_len as u32,
+                            start_epoch: to_epoch_seconds(
+                                rec.start_time().map_err(|e| e.to_string())?,
+                            ),
+                            component,
+                            count: rec.sample_cnt() as u32,
+                        });
                     }
-
-                    index.push(RecordRef {
-                        file: file_idx as u32,
-                        offset: pos,
-                        len: rec_len as u32,
-                        start_epoch: to_epoch_seconds(
-                            rec.start_time().map_err(|e| e.to_string())?,
-                        ),
-                        component,
-                        count: rec.sample_cnt() as u32,
-                    });
                 }
+                pos += rec_len as u64;
             }
+            Ok((local_index, local_fs, local_seen))
+        })
+        .collect();
 
-            pos += rec_len as u64;
+    let mut index = Vec::new();
+    let mut fs = None;
+    let mut seen = Vec::new();
+
+    // Aggregate parallel results
+    for (local_index, local_fs, local_seen) in thread_results? {
+        index.extend(local_index);
+        for c in local_seen {
+            if !seen.contains(&c) {
+                seen.push(c);
+            }
+        }
+        if let Some(rate) = local_fs {
+            match fs {
+                None => fs = Some(rate),
+                Some(existing) if (existing - rate).abs() > 1e-6 => {
+                    return Err(format!(
+                        "Mixed sample rates across files ({} and {} Hz); not supported",
+                        existing, rate
+                    ));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -369,8 +358,6 @@ fn build_index(files: &[PathBuf]) -> Result<(Vec<RecordRef>, f64), String> {
     Ok((index, fs))
 }
 
-/// Copies one record's unpacked samples into `dest`, widening whatever integer/float encoding the
-/// record uses to f64.
 fn copy_record_samples(
     rec: &mseed::MSRecord,
     count: usize,
@@ -401,16 +388,12 @@ fn copy_record_samples(
             }
         }
         other => {
-            return Err(format!(
-                "Unsupported sample type {:?} in {:?}",
-                other, file
-            ));
+            return Err(format!("Unsupported sample type {:?} in {:?}", other, file));
         }
     }
     Ok(())
 }
 
-/// Maps an FDSN source identifier / NSLC channel code to its E/N/Z component.
 fn component_of(sid: &str) -> Option<char> {
     let last = sid.rsplit(['_', '.']).next()?;
     match last.chars().next()?.to_ascii_uppercase() {
@@ -425,9 +408,6 @@ fn to_epoch_seconds(t: time::OffsetDateTime) -> f64 {
     t.unix_timestamp() as f64 + t.nanosecond() as f64 / 1e9
 }
 
-/// Fills NaN gaps that are bounded by real data on both sides with a cubic Hermite
-/// interpolation between the two boundary samples. Leading/trailing gaps (no boundary on one
-/// side) are left as NaN, so genuinely missing data stays marked as missing.
 fn interpolate_gaps(data: &mut [f64]) {
     let n = data.len();
     let mut i = 0;
@@ -450,8 +430,6 @@ fn interpolate_gaps(data: &mut [f64]) {
         let y0 = data[left];
         let y1 = data[right];
         let span = (right - left) as f64;
-        // m0/m1 are dy/dt tangents over the [0,1] gap parameter, so per-index slopes (central
-        // differences) are scaled by `span` while the boundary-value slope (already dy/dt) is not.
         let m0 = if left > 0 {
             ((y1 - data[left - 1]) / 2.0) * span
         } else {
@@ -465,19 +443,15 @@ fn interpolate_gaps(data: &mut [f64]) {
 
         for k in gap_start..gap_end {
             let t = (k - left) as f64 / span;
-            data[k] = hermite(t, y0, y1, m0, m1);
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+            let h10 = t3 - 2.0 * t2 + t;
+            let h01 = -2.0 * t3 + 3.0 * t2;
+            let h11 = t3 - t2;
+            data[k] = h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1;
         }
     }
-}
-
-fn hermite(t: f64, y0: f64, y1: f64, m0: f64, m1: f64) -> f64 {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
-    let h10 = t3 - 2.0 * t2 + t;
-    let h01 = -2.0 * t3 + 3.0 * t2;
-    let h11 = t3 - t2;
-    h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1
 }
 
 fn detrend_linear(data: &mut [f64]) {
@@ -519,13 +493,6 @@ fn detrend_linear(data: &mut [f64]) {
     }
 }
 
-/// Detrends, bandpass-filters, drops the leading `skip` samples (filter context plus decimation
-/// phase) and decimates.
-///
-/// Any sample still NaN after gap interpolation is genuinely missing data. A single NaN would
-/// propagate through the IIR filter and destroy the whole component, so those positions are
-/// zeroed for the filtering pass and restored to NaN afterwards, leaving downstream windowing to
-/// skip the windows that overlap them.
 fn process_component(
     mut data: Vec<f64>,
     freqmin: f64,
@@ -549,7 +516,6 @@ fn process_component(
         .collect();
 
     if missing.len() == data.len() {
-        // Nothing but gaps: skip the filter entirely and report the block as missing.
         let kept = data.len().saturating_sub(skip).div_ceil(decimation_factor);
         return Ok(vec![f64::NAN; kept]);
     }
