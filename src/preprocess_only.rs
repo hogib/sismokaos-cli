@@ -1,8 +1,9 @@
 use crate::config::AppConfig;
 use crate::preprocess::{self, ChannelChunk};
 use crate::types::PipelineEvent;
+use csv::{StringRecord, WriterBuilder};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
 
 pub fn run_preprocess_only(
     config: AppConfig,
@@ -26,41 +27,63 @@ pub fn run_preprocess_only(
         .output_root
         .join(format!("{}_preprocessed.csv", file_stem));
 
-    std::fs::create_dir_all(&config.output_root)
-        .map_err(|e| format!("Failed to create output directory {:?}: {}", config.output_root, e))?;
+    std::fs::create_dir_all(&config.output_root).map_err(|e| {
+        format!(
+            "Failed to create output directory {:?}: {}",
+            config.output_root, e
+        )
+    })?;
 
     let file = File::create(&out_path)
         .map_err(|e| format!("Failed to create preprocess output {:?}: {}", out_path, e))?;
-    let mut writer = BufWriter::new(file);
 
-    writeln!(writer, "index,time_minutes,E,N,Z")
+    // Switch to the csv crate for buffered, zero-allocation writing
+    let buffered_file = BufWriter::with_capacity(128 * 1024, file);
+    let mut writer = WriterBuilder::new().from_writer(buffered_file);
+
+    writer
+        .write_record(&["index", "time_minutes", "E", "N", "Z"])
         .map_err(|e| format!("Failed to write preprocess CSV header: {}", e))?;
 
     let mut global_index: usize = 0;
     let mut fs_out = config.fs;
+    let mut record = StringRecord::with_capacity(128, 5);
 
     preprocess::preprocess_directory_chunked(&config.data_dir, &config, |chunk: ChannelChunk| {
         fs_out = chunk.fs;
 
-        let len = chunk
-            .e
-            .len()
-            .min(chunk.n.len())
-            .min(chunk.z.len());
+        let len = chunk.e.len().min(chunk.n.len()).min(chunk.z.len());
+
+        // Safeguard against silent truncation
+        if chunk.e.len() != len || chunk.n.len() != len || chunk.z.len() != len {
+            let _ = progress_tx.send(PipelineEvent::Warning(format!(
+                "Channel lengths mismatched in chunk! E: {}, N: {}, Z: {}",
+                chunk.e.len(),
+                chunk.n.len(),
+                chunk.z.len()
+            )));
+        }
 
         for i in 0..len {
             let idx = global_index + i;
             let time_minutes = (idx as f64 / fs_out) / 60.0;
-            writeln!(
-                writer,
-                "{},{:.8},{:.10},{:.10},{:.10}",
-                idx, time_minutes, chunk.e[i], chunk.n[i], chunk.z[i]
-            )
-            .map_err(|e| format!("Failed to write preprocess CSV row: {}", e))?;
-            let _ = progress_tx.send(PipelineEvent::WindowProcessed);
+
+            record.clear();
+            record.push_field(&idx.to_string());
+            record.push_field(&format!("{:.8}", time_minutes));
+            record.push_field(&format!("{:.10}", chunk.e[i]));
+            record.push_field(&format!("{:.10}", chunk.n[i]));
+            record.push_field(&format!("{:.10}", chunk.z[i]));
+
+            writer
+                .write_record(&record)
+                .map_err(|e| format!("Failed to write preprocess CSV row: {}", e))?;
         }
 
         global_index += len;
+
+        // Report progress once per chunk, avoiding MPSC lockups
+        let _ = progress_tx.send(PipelineEvent::ChunkProcessed(len));
         Ok(())
     })?;
 

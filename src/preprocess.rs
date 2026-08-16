@@ -1,7 +1,7 @@
 use butterworth::{Cutoff, Filter};
 use mseed::{MSControlFlags, MSRecord, MSSampleType, detect};
 use rayon::prelude::*;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ const COMPONENTS: [char; 3] = ['E', 'N', 'Z'];
 struct Assembler {
     start_epoch: f64,
     fs: f64,
-    comps: HashMap<char, VecDeque<f64>>,
+    comps: HashMap<char, Vec<f64>>,
     watermark: f64,
     context: Vec<HashMap<char, Vec<f64>>>,
     global_offset: usize,
@@ -63,10 +63,7 @@ pub fn preprocess_directory_chunked(
     let mut asm = Assembler {
         start_epoch: f64::NAN,
         fs: native_fs,
-        comps: COMPONENTS
-            .into_iter()
-            .map(|c| (c, VecDeque::new()))
-            .collect(),
+        comps: COMPONENTS.into_iter().map(|c| (c, Vec::new())).collect(),
         watermark: f64::NEG_INFINITY,
         context: Vec::new(),
         global_offset: 0,
@@ -77,25 +74,35 @@ pub fn preprocess_directory_chunked(
     let out_fs = native_fs / decimation_factor as f64;
     let block_len = (BLOCK_SECONDS * native_fs) as usize;
 
-    let mut handles: Vec<File> = Vec::with_capacity(files.len());
-    for f in &files {
-        handles.push(File::open(f).map_err(|e| format!("Failed to open {:?}: {}", f, e))?);
-    }
-
+    let mut file_cache: Vec<(u32, File)> = Vec::with_capacity(8);
     let mut raw = Vec::new();
+
     for r in &index {
-        let file = &files[r.file as usize];
+        let file_path = &files[r.file as usize];
         raw.resize(r.len as usize, 0u8);
-        let handle = &mut handles[r.file as usize];
+
+        if let Some(pos) = file_cache.iter().position(|(i, _)| *i == r.file) {
+            let entry = file_cache.remove(pos);
+            file_cache.push(entry);
+        } else {
+            if file_cache.len() == 8 {
+                file_cache.remove(0);
+            }
+            let f = File::open(file_path)
+                .map_err(|e| format!("Failed to open {:?}: {}", file_path, e))?;
+            file_cache.push((r.file, f));
+        }
+
+        let handle = &mut file_cache.last_mut().unwrap().1;
         handle
             .seek(SeekFrom::Start(r.offset))
-            .map_err(|e| format!("Failed to seek in {:?}: {}", file, e))?;
+            .map_err(|e| format!("Failed to seek in {:?}: {}", file_path, e))?;
         handle
             .read_exact(&mut raw)
-            .map_err(|e| format!("Failed to read record from {:?}: {}", file, e))?;
+            .map_err(|e| format!("Failed to read record from {:?}: {}", file_path, e))?;
 
         let rec = MSRecord::parse(&raw, MSControlFlags::MSF_UNPACKDATA)
-            .map_err(|e| format!("Failed to unpack record in {:?}: {}", file, e))?;
+            .map_err(|e| format!("Failed to unpack record in {:?}: {}", file_path, e))?;
 
         let count = (rec.num_samples() as usize).min(r.count as usize);
         if count == 0 {
@@ -103,6 +110,11 @@ pub fn preprocess_directory_chunked(
         }
 
         if asm.start_epoch.is_nan() {
+            asm.start_epoch = r.start_epoch;
+        }
+
+        let available = asm.comps.values().map(|v| v.len()).max().unwrap_or(0);
+        if available == 0 && r.start_epoch > asm.start_epoch + BLOCK_SECONDS {
             asm.start_epoch = r.start_epoch;
         }
 
@@ -117,9 +129,8 @@ pub fn preprocess_directory_chunked(
         if dest.len() < idx + count {
             dest.resize(idx + count, f64::NAN);
         }
-        // Force the VecDeque memory to be contiguous for safe slice writing
-        let dest_slice = dest.make_contiguous();
-        copy_record_samples(&rec, count, &mut dest_slice[idx..idx + count], file)?;
+
+        copy_record_samples(&rec, count, &mut dest[idx..idx + count], file_path)?;
 
         asm.watermark = asm
             .watermark
@@ -189,13 +200,11 @@ fn flush_block(
     let mut next_context = HashMap::new();
     for comp in COMPONENTS {
         let v = asm.comps.get_mut(&comp).unwrap();
-        let slice = v.make_contiguous();
-        next_context.insert(comp, slice[take - context_len..take].to_vec());
+        next_context.insert(comp, v[take - context_len..take].to_vec());
     }
 
     let phase = (decimation_factor - (asm.global_offset % decimation_factor)) % decimation_factor;
 
-    // Component-level concurrency: Filter E, N, and Z concurrently
     let processed_results: Result<Vec<(char, Vec<f64>)>, String> = COMPONENTS
         .par_iter()
         .map(|&comp| {
@@ -206,17 +215,7 @@ fn flush_block(
             }
 
             let v = &asm.comps[&comp];
-            let (slice1, slice2) = v.as_slices();
-
-            let mut taken = 0;
-            let take_s1 = take.min(slice1.len());
-            combined.extend_from_slice(&slice1[..take_s1]);
-            taken += take_s1;
-
-            if taken < take {
-                let take_s2 = (take - taken).min(slice2.len());
-                combined.extend_from_slice(&slice2[..take_s2]);
-            }
+            combined.extend_from_slice(&v[..take]);
 
             let processed = process_component(
                 combined,
@@ -240,7 +239,7 @@ fn flush_block(
     })?;
 
     for v in asm.comps.values_mut() {
-        v.drain(0..take); // O(1) Fast drain on VecDeque
+        v.drain(0..take);
     }
     asm.start_epoch += take as f64 / asm.fs;
     asm.global_offset += take;
@@ -251,7 +250,6 @@ fn flush_block(
 }
 
 fn build_index(files: &[PathBuf]) -> Result<(Vec<RecordRef>, f64), String> {
-    // I/O Concurrency: Read headers and detect records across all files in parallel.
     let thread_results: Result<Vec<(Vec<RecordRef>, Option<f64>, Vec<char>)>, String> = files
         .par_iter()
         .enumerate()
@@ -340,7 +338,6 @@ fn build_index(files: &[PathBuf]) -> Result<(Vec<RecordRef>, f64), String> {
     let mut fs = None;
     let mut seen = Vec::new();
 
-    // Aggregate parallel results
     for (local_index, local_fs, local_seen) in thread_results? {
         index.extend(local_index);
         for c in local_seen {
@@ -473,41 +470,56 @@ fn interpolate_gaps(data: &mut [f64]) {
 }
 
 fn detrend_linear(data: &mut [f64]) {
-    let n = data.len();
-    if n == 0 {
-        return;
-    }
+    let mut sum_y = 0.0;
+    let mut count: f64 = 0.0;
 
-    let (mut sum_x, mut sum_y, mut sum_xx, mut sum_xy, mut count) = (0.0, 0.0, 0.0, 0.0, 0.0);
-    for (i, &y) in data.iter().enumerate() {
-        if y.is_nan() {
-            continue;
+    for &y in data.iter() {
+        if !y.is_nan() {
+            sum_y += y;
+            count += 1.0;
         }
-        let x = i as f64;
-        sum_x += x;
-        sum_y += y;
-        sum_xx += x * x;
-        sum_xy += x * y;
-        count += 1.0;
     }
 
-    if count == 0.0 {
-        return;
-    }
-
-    let denom = count * sum_xx - sum_x * sum_x;
-    if count < 2.0 || denom.abs() < f64::EPSILON {
-        let mean = sum_y / count;
-        for y in data.iter_mut() {
+    if count < 2.0 {
+        let mean = sum_y / count.max(1.0);
+        for y in data.iter_mut().filter(|y| !y.is_nan()) {
             *y -= mean;
         }
         return;
     }
 
-    let slope = (count * sum_xy - sum_x * sum_y) / denom;
-    let intercept = (sum_y - slope * sum_x) / count;
+    let mean_y = sum_y / count;
+
+    let mut sum_x = 0.0;
+    for (i, &y) in data.iter().enumerate() {
+        if !y.is_nan() {
+            sum_x += i as f64;
+        }
+    }
+    let mean_x = sum_x / count;
+
+    let mut sum_dx_dy = 0.0;
+    let mut sum_dx2 = 0.0;
+
+    for (i, &y) in data.iter().enumerate() {
+        if !y.is_nan() {
+            let dx = i as f64 - mean_x;
+            sum_dx_dy += dx * (y - mean_y);
+            sum_dx2 += dx * dx;
+        }
+    }
+
+    let slope = if sum_dx2.abs() < f64::EPSILON {
+        0.0
+    } else {
+        sum_dx_dy / sum_dx2
+    };
+    let intercept = mean_y - slope * mean_x;
+
     for (i, y) in data.iter_mut().enumerate() {
-        *y -= intercept + slope * i as f64;
+        if !y.is_nan() {
+            *y -= intercept + slope * i as f64;
+        }
     }
 }
 

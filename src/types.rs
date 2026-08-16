@@ -7,6 +7,7 @@ pub enum PipelineEvent {
     /// Started processing the input directory
     FolderStarted(String),
     /// Successfully computed and wrote a single window
+    ChunkProcessed(usize),
     WindowProcessed,
     /// All windows have been written
     Completed,

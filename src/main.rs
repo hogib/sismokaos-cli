@@ -73,6 +73,13 @@ fn main() {
                             let _ = std::io::stdout().flush();
                         }
                     }
+                    PipelineEvent::ChunkProcessed(sample_count) => {
+                        processed_windows += sample_count as u64;
+                        if processed_windows % 100_000 < sample_count as u64 {
+                            print!("\r Samples processed: {}", processed_windows);
+                            let _ = std::io::stdout().flush();
+                        }
+                    }
                     PipelineEvent::Completed => {
                         println!("\r Windows processed: {}", processed_windows);
                     }
