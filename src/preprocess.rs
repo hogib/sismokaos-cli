@@ -1,6 +1,7 @@
 use butterworth::{Cutoff, Filter};
 use mseed::{MSControlFlags, MSRecord, MSSampleType, detect};
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -12,11 +13,16 @@ const BLOCK_SECONDS: f64 = 3600.0;
 const WATERMARK_SECONDS: f64 = 60.0;
 const FILTER_CONTEXT_SECONDS: f64 = 120.0;
 
+thread_local! {
+    static SCRATCH_BUF: RefCell<Vec<f64>> = RefCell::new(Vec::with_capacity(3600 * 250));
+}
+
 pub struct ChannelChunk {
     pub e: Vec<f64>,
     pub n: Vec<f64>,
     pub z: Vec<f64>,
     pub fs: f64,
+    pub start_epoch: f64,
 }
 
 const COMPONENTS: [char; 3] = ['E', 'N', 'Z'];
@@ -208,24 +214,28 @@ fn flush_block(
     let processed_results: Result<Vec<(char, Vec<f64>)>, String> = COMPONENTS
         .par_iter()
         .map(|&comp| {
-            let mut combined = Vec::with_capacity(lead + take);
-            if lead > 0 {
-                let ctx = &asm.context[0][&comp];
-                combined.extend_from_slice(&ctx[ctx.len() - lead..]);
-            }
+            SCRATCH_BUF.with(|cell| {
+                let mut combined = cell.borrow_mut();
+                combined.clear();
 
-            let v = &asm.comps[&comp];
-            combined.extend_from_slice(&v[..take]);
+                if lead > 0 {
+                    let ctx = &asm.context[0][&comp];
+                    combined.extend_from_slice(&ctx[ctx.len() - lead..]);
+                }
 
-            let processed = process_component(
-                combined,
-                config.freqmin,
-                config.freqmax,
-                asm.fs,
-                decimation_factor,
-                lead + phase,
-            )?;
-            Ok((comp, processed))
+                let v = &asm.comps[&comp];
+                combined.extend_from_slice(&v[..take]);
+
+                let processed = process_component(
+                    &mut *combined,
+                    config.freqmin,
+                    config.freqmax,
+                    asm.fs,
+                    decimation_factor,
+                    lead + phase,
+                )?;
+                Ok((comp, processed))
+            })
         })
         .collect();
 
@@ -236,6 +246,7 @@ fn flush_block(
         n: out.remove(&'N').unwrap(),
         z: out.remove(&'Z').unwrap(),
         fs: out_fs,
+        start_epoch: asm.start_epoch,
     })?;
 
     for v in asm.comps.values_mut() {
@@ -425,6 +436,10 @@ fn to_epoch_seconds(t: time::OffsetDateTime) -> f64 {
 
 fn interpolate_gaps(data: &mut [f64]) {
     let n = data.len();
+    if n == 0 || !data.iter().any(|v| v.is_nan()) {
+        return; // Fast path: Bypass entirely if no gaps
+    }
+
     let mut i = 0;
     while i < n {
         if !data[i].is_nan() {
@@ -470,61 +485,98 @@ fn interpolate_gaps(data: &mut [f64]) {
 }
 
 fn detrend_linear(data: &mut [f64]) {
-    let mut sum_y = 0.0;
-    let mut count: f64 = 0.0;
-
-    for &y in data.iter() {
-        if !y.is_nan() {
-            sum_y += y;
-            count += 1.0;
-        }
-    }
-
-    if count < 2.0 {
-        let mean = sum_y / count.max(1.0);
-        for y in data.iter_mut().filter(|y| !y.is_nan()) {
-            *y -= mean;
-        }
+    let n = data.len();
+    if n < 2 {
         return;
     }
 
-    let mean_y = sum_y / count;
+    let has_nans = data.iter().any(|v| v.is_nan());
 
-    let mut sum_x = 0.0;
-    for (i, &y) in data.iter().enumerate() {
-        if !y.is_nan() {
-            sum_x += i as f64;
-        }
-    }
-    let mean_x = sum_x / count;
+    if !has_nans {
+        // SIMD-friendly fast path (no branches)
+        let count = n as f64;
+        let sum_y: f64 = data.iter().sum();
+        let mean_y = sum_y / count;
 
-    let mut sum_dx_dy = 0.0;
-    let mut sum_dx2 = 0.0;
+        let sum_x = (n * (n - 1)) as f64 / 2.0;
+        let mean_x = sum_x / count;
 
-    for (i, &y) in data.iter().enumerate() {
-        if !y.is_nan() {
+        let mut sum_dx_dy = 0.0;
+        let mut sum_dx2 = 0.0;
+
+        for (i, &y) in data.iter().enumerate() {
             let dx = i as f64 - mean_x;
             sum_dx_dy += dx * (y - mean_y);
             sum_dx2 += dx * dx;
         }
-    }
 
-    let slope = if sum_dx2.abs() < f64::EPSILON {
-        0.0
-    } else {
-        sum_dx_dy / sum_dx2
-    };
-    let intercept = mean_y - slope * mean_x;
+        let slope = if sum_dx2.abs() < f64::EPSILON {
+            0.0
+        } else {
+            sum_dx_dy / sum_dx2
+        };
+        let intercept = mean_y - slope * mean_x;
 
-    for (i, y) in data.iter_mut().enumerate() {
-        if !y.is_nan() {
+        for (i, y) in data.iter_mut().enumerate() {
             *y -= intercept + slope * i as f64;
+        }
+    } else {
+        // Fallback for data with gaps (NaNs)
+        let mut sum_y = 0.0;
+        let mut count: f64 = 0.0;
+        for &y in data.iter() {
+            if !y.is_nan() {
+                sum_y += y;
+                count += 1.0;
+            }
+        }
+
+        if count < 2.0 {
+            let mean = sum_y / count.max(1.0);
+            for y in data.iter_mut().filter(|y| !y.is_nan()) {
+                *y -= mean;
+            }
+            return;
+        }
+
+        let mean_y = sum_y / count;
+
+        let mut sum_x = 0.0;
+        for (i, &y) in data.iter().enumerate() {
+            if !y.is_nan() {
+                sum_x += i as f64;
+            }
+        }
+        let mean_x = sum_x / count;
+
+        let mut sum_dx_dy = 0.0;
+        let mut sum_dx2 = 0.0;
+
+        for (i, &y) in data.iter().enumerate() {
+            if !y.is_nan() {
+                let dx = i as f64 - mean_x;
+                sum_dx_dy += dx * (y - mean_y);
+                sum_dx2 += dx * dx;
+            }
+        }
+
+        let slope = if sum_dx2.abs() < f64::EPSILON {
+            0.0
+        } else {
+            sum_dx_dy / sum_dx2
+        };
+        let intercept = mean_y - slope * mean_x;
+
+        for (i, y) in data.iter_mut().enumerate() {
+            if !y.is_nan() {
+                *y -= intercept + slope * i as f64;
+            }
         }
     }
 }
 
 fn process_component(
-    mut data: Vec<f64>,
+    data: &mut Vec<f64>,
     freqmin: f64,
     freqmax: f64,
     fs: f64,
@@ -532,34 +584,30 @@ fn process_component(
     skip: usize,
 ) -> Result<Vec<f64>, String> {
     if data.is_empty() {
-        return Ok(data);
+        return Ok(Vec::new());
     }
 
-    interpolate_gaps(&mut data);
-    detrend_linear(&mut data);
+    interpolate_gaps(data);
+    detrend_linear(data);
 
-    let missing: Vec<usize> = data
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.is_nan())
-        .map(|(i, _)| i)
-        .collect();
+    let mut missing = Vec::new();
+    for (i, v) in data.iter_mut().enumerate() {
+        if v.is_nan() {
+            missing.push(i);
+            *v = 0.0;
+        }
+    }
 
     if missing.len() == data.len() {
         let kept = data.len().saturating_sub(skip).div_ceil(decimation_factor);
         return Ok(vec![f64::NAN; kept]);
     }
 
-    for &i in &missing {
-        data[i] = 0.0;
-    }
-
     let filter =
         Filter::new(4, fs, Cutoff::BandPass(freqmin, freqmax)).map_err(|e| e.to_string())?;
-    let mut filtered = filter.bidirectional(&data).map_err(|e| e.to_string())?;
-    drop(data);
+    let mut filtered = filter.bidirectional(data).map_err(|e| e.to_string())?;
 
-    for &i in &missing {
+    for i in missing {
         filtered[i] = f64::NAN;
     }
 

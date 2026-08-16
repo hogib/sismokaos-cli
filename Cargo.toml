@@ -14,6 +14,8 @@ mseed = "0.7.1"
 butterworth = "0.1.0"
 time = "0.3.55"
 mimalloc = "0.1.52"
+ryu = "1.0"
+itoa = "1.0"
 
 [patch.crates-io]
 libmseed-sys = { path = "vendor/libmseed-sys" }

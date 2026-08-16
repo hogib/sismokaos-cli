@@ -37,8 +37,7 @@ pub fn run_preprocess_only(
     let file = File::create(&out_path)
         .map_err(|e| format!("Failed to create preprocess output {:?}: {}", out_path, e))?;
 
-    // Switch to the csv crate for buffered, zero-allocation writing
-    let buffered_file = BufWriter::with_capacity(128 * 1024, file);
+    let buffered_file = BufWriter::with_capacity(256 * 1024, file);
     let mut writer = WriterBuilder::new().from_writer(buffered_file);
 
     writer
@@ -49,12 +48,14 @@ pub fn run_preprocess_only(
     let mut fs_out = config.fs;
     let mut record = StringRecord::with_capacity(128, 5);
 
+    let mut ryu_buf = ryu::Buffer::new();
+    let mut itoa_buf = itoa::Buffer::new();
+
     preprocess::preprocess_directory_chunked(&config.data_dir, &config, |chunk: ChannelChunk| {
         fs_out = chunk.fs;
 
         let len = chunk.e.len().min(chunk.n.len()).min(chunk.z.len());
 
-        // Safeguard against silent truncation
         if chunk.e.len() != len || chunk.n.len() != len || chunk.z.len() != len {
             let _ = progress_tx.send(PipelineEvent::Warning(format!(
                 "Channel lengths mismatched in chunk! E: {}, N: {}, Z: {}",
@@ -66,14 +67,15 @@ pub fn run_preprocess_only(
 
         for i in 0..len {
             let idx = global_index + i;
-            let time_minutes = (idx as f64 / fs_out) / 60.0;
+            let sample_epoch = chunk.start_epoch + (i as f64 / fs_out);
+            let time_minutes = sample_epoch / 60.0;
 
             record.clear();
-            record.push_field(&idx.to_string());
-            record.push_field(&format!("{:.8}", time_minutes));
-            record.push_field(&format!("{:.10}", chunk.e[i]));
-            record.push_field(&format!("{:.10}", chunk.n[i]));
-            record.push_field(&format!("{:.10}", chunk.z[i]));
+            record.push_field(itoa_buf.format(idx));
+            record.push_field(ryu_buf.format(time_minutes));
+            record.push_field(ryu_buf.format(chunk.e[i]));
+            record.push_field(ryu_buf.format(chunk.n[i]));
+            record.push_field(ryu_buf.format(chunk.z[i]));
 
             writer
                 .write_record(&record)
@@ -81,8 +83,6 @@ pub fn run_preprocess_only(
         }
 
         global_index += len;
-
-        // Report progress once per chunk, avoiding MPSC lockups
         let _ = progress_tx.send(PipelineEvent::ChunkProcessed(len));
         Ok(())
     })?;

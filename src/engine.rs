@@ -50,10 +50,22 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
     let mut window_idx: usize = 0;
     let mut fs_out = config.fs;
     let mut writer: Option<FeatureWriter> = None;
+    let mut current_buffer_epoch: f64 = f64::NAN;
 
     // Consume chunks as they arrive asynchronously
     for chunk in chunk_rx {
         fs_out = chunk.fs;
+        let expected_next_epoch = current_buffer_epoch + (buf_e.len() as f64 / fs_out);
+
+        if current_buffer_epoch.is_nan()
+            || buf_e.is_empty()
+            || (chunk.start_epoch - expected_next_epoch).abs() > (1.5 / fs_out)
+        {
+            buf_e.clear();
+            buf_n.clear();
+            buf_z.clear();
+            current_buffer_epoch = chunk.start_epoch;
+        }
         buf_e.extend(chunk.e);
         buf_n.extend(chunk.n);
         buf_z.extend(chunk.z);
@@ -78,7 +90,9 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
             .par_iter()
             .map(|&start| {
                 let end = start + config.win_size;
-                let time_minutes = ((global_offset + end) as f64 / fs_out) / 60.0;
+                let window_epoch = current_buffer_epoch + (end as f64 / fs_out);
+                let time_minutes = window_epoch / 60.0;
+
                 let window_features = compute_window(
                     &slice_e[start..end],
                     &slice_n[start..end],
@@ -113,11 +127,11 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
             buf_e.drain(0..cursor);
             buf_n.drain(0..cursor);
             buf_z.drain(0..cursor);
+            current_buffer_epoch += cursor as f64 / fs_out;
             global_offset += cursor;
         }
     }
 
-    // Ensure preprocessor finished successfully and catch any errors it yielded
     preprocessor_thread
         .join()
         .map_err(|_| "Preprocessor thread panicked".to_string())??;
