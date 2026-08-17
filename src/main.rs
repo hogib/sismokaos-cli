@@ -5,6 +5,7 @@ mod export;
 mod features;
 mod preprocess;
 mod preprocess_only;
+mod raw_binary;
 mod types;
 
 use clap::Parser;
@@ -34,6 +35,18 @@ fn main() {
         Commands::Run { dry_run, .. } | Commands::Preprocess { dry_run, .. } => {
             let mut app_config = AppConfig::from_json(&cli.config);
             app_config.merge_with_cli(&cli);
+
+            // Checked before any work starts. These are combinations whose
+            // damage is invisible in the output, so failing late would mean
+            // shipping a corrupt dataset that looks perfectly fine.
+            let problems = app_config.validate();
+            if !problems.is_empty() {
+                eprintln!("[ERROR] Invalid configuration:");
+                for p in &problems {
+                    eprintln!("  - {}", p);
+                }
+                std::process::exit(2);
+            }
 
             if *dry_run {
                 println!("[DRY RUN ENABLED] Exiting without processing.");

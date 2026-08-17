@@ -1,10 +1,14 @@
 use crate::config::AppConfig;
 use crate::preprocess::{self, ChannelChunk};
+use crate::raw_binary::RawBinaryWriter;
 use crate::types::PipelineEvent;
-use csv::{StringRecord, WriterBuilder};
-use std::fs::File;
-use std::io::BufWriter;
 
+/// Preprocess-only pipeline: filtered, decimated E/N/Z written as flat
+/// little-endian f32 plus a JSON sidecar.
+///
+/// See `raw_binary` for why this is not Parquet. In short: the Parquet was
+/// read exactly once, by a Python script that rewrote it as this very layout,
+/// and it cost 16.41 GB where this costs 8.63 GB for the same 10 Hz archive.
 pub fn run_preprocess_only(
     config: AppConfig,
     progress_tx: std::sync::mpsc::Sender<PipelineEvent>,
@@ -25,7 +29,7 @@ pub fn run_preprocess_only(
 
     let out_path = config
         .output_root
-        .join(format!("{}_preprocessed.csv", file_stem));
+        .join(format!("{}_preprocessed", file_stem));
 
     std::fs::create_dir_all(&config.output_root).map_err(|e| {
         format!(
@@ -34,26 +38,10 @@ pub fn run_preprocess_only(
         )
     })?;
 
-    let file = File::create(&out_path)
-        .map_err(|e| format!("Failed to create preprocess output {:?}: {}", out_path, e))?;
-
-    let buffered_file = BufWriter::with_capacity(256 * 1024, file);
-    let mut writer = WriterBuilder::new().from_writer(buffered_file);
-
-    writer
-        .write_record(&["index", "time_minutes", "E", "N", "Z"])
-        .map_err(|e| format!("Failed to write preprocess CSV header: {}", e))?;
-
-    let mut global_index: usize = 0;
-    let mut fs_out = config.fs;
-    let mut record = StringRecord::with_capacity(128, 5);
-
-    let mut ryu_buf = ryu::Buffer::new();
-    let mut itoa_buf = itoa::Buffer::new();
+    let mut writer = RawBinaryWriter::create(&out_path)?;
+    let mut total: u64 = 0;
 
     preprocess::preprocess_directory_chunked(&config.data_dir, &config, |chunk: ChannelChunk| {
-        fs_out = chunk.fs;
-
         let len = chunk.e.len().min(chunk.n.len()).min(chunk.z.len());
 
         if chunk.e.len() != len || chunk.n.len() != len || chunk.z.len() != len {
@@ -65,37 +53,34 @@ pub fn run_preprocess_only(
             )));
         }
 
-        for i in 0..len {
-            let idx = global_index + i;
-            let sample_epoch = chunk.start_epoch + (i as f64 / fs_out);
-            let time_minutes = sample_epoch / 60.0;
+        writer.write_chunk(
+            &chunk.e[..len],
+            &chunk.n[..len],
+            &chunk.z[..len],
+            chunk.fs,
+            chunk.start_epoch,
+        )?;
+        total += len as u64;
 
-            record.clear();
-            record.push_field(itoa_buf.format(idx));
-            record.push_field(ryu_buf.format(time_minutes));
-            record.push_field(ryu_buf.format(chunk.e[i]));
-            record.push_field(ryu_buf.format(chunk.n[i]));
-            record.push_field(ryu_buf.format(chunk.z[i]));
-
-            writer
-                .write_record(&record)
-                .map_err(|e| format!("Failed to write preprocess CSV row: {}", e))?;
-        }
-
-        global_index += len;
         let _ = progress_tx.send(PipelineEvent::ChunkProcessed(len));
         Ok(())
     })?;
 
-    writer
-        .flush()
-        .map_err(|e| format!("Failed to flush preprocess CSV {:?}: {}", out_path, e))?;
+    let path = writer.path().to_path_buf();
+    let samples = writer.finish(&config)?;
 
-    if global_index == 0 {
+    if samples == 0 {
         let _ = progress_tx.send(PipelineEvent::Warning(
             "No samples produced during preprocessing.".to_string(),
         ));
     } else {
+        println!(
+            "[OUTPUT] {} samples x 3 channels -> {:?} ({:.2} GB)",
+            samples,
+            path,
+            (samples as f64 * 3.0 * 4.0) / 1e9
+        );
+        println!("[OUTPUT] metadata -> {:?}", path.with_extension("f32.json"));
         let _ = progress_tx.send(PipelineEvent::Completed);
     }
 

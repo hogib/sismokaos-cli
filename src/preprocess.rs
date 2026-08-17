@@ -76,6 +76,10 @@ pub fn preprocess_directory_chunked(
         dropped_late_records: 0,
     };
 
+    if let Some(warning) = config.check_decimation(native_fs) {
+        eprintln!("[WARNING] {}", warning);
+    }
+
     let decimation_factor = ((native_fs / config.fs) as usize).max(1);
     let out_fs = native_fs / decimation_factor as f64;
     let block_len = (BLOCK_SECONDS * native_fs) as usize;
@@ -119,9 +123,20 @@ pub fn preprocess_directory_chunked(
             asm.start_epoch = r.start_epoch;
         }
 
-        let available = asm.comps.values().map(|v| v.len()).max().unwrap_or(0);
-        if available == 0 && r.start_epoch > asm.start_epoch + BLOCK_SECONDS {
+        if (r.start_epoch - asm.start_epoch) > (2.0 * BLOCK_SECONDS) {
+            while asm.comps.values().any(|v| !v.is_empty()) {
+                flush_block(
+                    &mut asm,
+                    block_len,
+                    config,
+                    decimation_factor,
+                    out_fs,
+                    &mut on_chunk,
+                )?;
+            }
             asm.start_epoch = r.start_epoch;
+            asm.watermark = f64::NEG_INFINITY;
+            asm.context.clear();
         }
 
         let idx = ((r.start_epoch - asm.start_epoch) * native_fs).round() as i64;
@@ -460,13 +475,26 @@ fn interpolate_gaps(data: &mut [f64]) {
         let y0 = data[left];
         let y1 = data[right];
         let span = (right - left) as f64;
+
+        // Catmull-Rom tangents, as a slope per SAMPLE scaled into the Hermite
+        // parameter t in [0, 1] (hence the `* span`).
+        //
+        // The divisor must be the real index distance between the two samples
+        // being differenced, not a constant. `left - 1` and `right` are
+        // `span + 1` samples apart; dividing by 2 is only correct for a
+        // single-sample gap. With the constant, tangents were overestimated by
+        // (span + 1) / 2 -- a factor of 50 across a 100-sample gap -- and the
+        // interpolant overshot wildly: measured on a sine of amplitude 100, a
+        // 100-sample gap filled to a peak of 894, worse than plain linear
+        // interpolation for any gap beyond ~10 samples. Those spikes then
+        // passed through the bandpass into the features.
         let m0 = if left > 0 {
-            ((y1 - data[left - 1]) / 2.0) * span
+            ((y1 - data[left - 1]) / (span + 1.0)) * span
         } else {
             y1 - y0
         };
         let m1 = if right + 1 < n {
-            ((data[right + 1] - y0) / 2.0) * span
+            ((data[right + 1] - y0) / (span + 1.0)) * span
         } else {
             y1 - y0
         };
@@ -617,4 +645,99 @@ fn process_component(
         .step_by(decimation_factor)
         .copied()
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sine(n: usize, amp: f64) -> Vec<f64> {
+        (0..n)
+            .map(|i| (i as f64 / n as f64 * 4.0 * std::f64::consts::PI).sin() * amp)
+            .collect()
+    }
+
+    /// The interpolant must not invent amplitude that is not in the signal.
+    ///
+    /// This is the regression test for the Catmull-Rom tangent scaling: with a
+    /// constant divisor of 2.0 a 100-sample gap in a sine of amplitude 100
+    /// filled to a peak of ~894.
+    #[test]
+    fn interpolated_gaps_do_not_overshoot() {
+        for gap in [1usize, 2, 5, 20, 100] {
+            let clean = sine(400, 100.0);
+            let mut data = clean.clone();
+            let start = 150;
+            for v in data[start..start + gap].iter_mut() {
+                *v = f64::NAN;
+            }
+            interpolate_gaps(&mut data);
+
+            let peak = data[start..start + gap]
+                .iter()
+                .fold(0.0f64, |m, v| m.max(v.abs()));
+            assert!(
+                peak <= 110.0,
+                "gap of {gap} samples filled to peak {peak:.1}, signal peak is 100"
+            );
+
+            // And it should be no worse than linear interpolation across the gap.
+            let (y0, y1) = (clean[start - 1], clean[start + gap]);
+            let lin_err = (0..gap)
+                .map(|k| {
+                    let t = (k + 1) as f64 / (gap + 1) as f64;
+                    (y0 + (y1 - y0) * t - clean[start + k]).abs()
+                })
+                .fold(0.0f64, f64::max);
+            let err = (0..gap)
+                .map(|k| (data[start + k] - clean[start + k]).abs())
+                .fold(0.0f64, f64::max);
+            assert!(
+                err <= lin_err * 1.5 + 1e-6,
+                "gap {gap}: hermite error {err:.2} vs linear {lin_err:.2}"
+            );
+        }
+    }
+
+    /// A single-sample gap is the one case the old constant divisor got right;
+    /// pin it so the fix cannot regress the easy case.
+    #[test]
+    fn single_sample_gap_is_near_exact() {
+        let clean = sine(400, 100.0);
+        let mut data = clean.clone();
+        data[200] = f64::NAN;
+        interpolate_gaps(&mut data);
+        assert!((data[200] - clean[200]).abs() < 0.1);
+    }
+
+    /// Leading and trailing gaps have no bracketing sample, so they must stay
+    /// NaN rather than be silently extrapolated.
+    #[test]
+    fn edge_gaps_are_left_as_nan() {
+        let mut data = sine(100, 10.0);
+        data[0] = f64::NAN;
+        data[1] = f64::NAN;
+        data[99] = f64::NAN;
+        interpolate_gaps(&mut data);
+        assert!(data[0].is_nan() && data[1].is_nan() && data[99].is_nan());
+        assert!(data[50].is_finite());
+    }
+
+    #[test]
+    fn detrend_removes_a_linear_ramp() {
+        let mut data: Vec<f64> = (0..1000).map(|i| 5.0 + 0.25 * i as f64).collect();
+        detrend_linear(&mut data);
+        assert!(data.iter().all(|v| v.abs() < 1e-6));
+    }
+
+    /// Detrend must ignore NaNs rather than propagate them into the fit.
+    #[test]
+    fn detrend_tolerates_gaps() {
+        let mut data: Vec<f64> = (0..1000).map(|i| 5.0 + 0.25 * i as f64).collect();
+        data[10] = f64::NAN;
+        data[500] = f64::NAN;
+        detrend_linear(&mut data);
+        assert!(data[10].is_nan() && data[500].is_nan());
+        assert!(data.iter().filter(|v| v.is_finite()).all(|v| v.abs() < 1e-6));
+    }
 }
