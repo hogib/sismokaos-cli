@@ -1,17 +1,20 @@
 use crate::config::AppConfig;
-use csv::{StringRecord, Writer, WriterBuilder};
+use polars::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::BufWriter;
 use std::path::Path;
 
-/// Writes feature rows to CSV incrementally.
+/// Accumulates feature rows in memory and writes to Parquet on finish.
 pub struct FeatureWriter {
-    writer: Writer<BufWriter<File>>,
     feature_names: Vec<&'static str>,
     prev_values: Option<Vec<f64>>,
-    record: StringRecord,
     rows_written: usize,
+
+    // Columnar buffers for Polars
+    pencere_ids: Vec<String>,
+    zaman_dks: Vec<f64>,
+    feature_cols: Vec<Vec<Option<f64>>>,
+    dev_cols: Vec<Vec<Option<f64>>>,
 }
 
 impl FeatureWriter {
@@ -26,25 +29,17 @@ impl FeatureWriter {
         let mut feature_names: Vec<&'static str> = first_features.keys().copied().collect();
         feature_names.sort();
 
-        let file = File::create(output_path)?;
-        let buffered_file = BufWriter::with_capacity(128 * 1024, file);
-        let mut writer = WriterBuilder::new().from_writer(buffered_file);
-
-        let expected_cols = 2 + (feature_names.len() * 2);
-
-        let record = StringRecord::with_capacity(1024, expected_cols);
-
-        let mut header = vec!["Pencere_ID".to_string(), "Zaman_Dk".to_string()];
-        header.extend(feature_names.iter().map(|s| s.to_string()));
-        header.extend(feature_names.iter().map(|n| format!("{}_DEV", n)));
-        writer.write_record(&header)?;
+        let num_features = feature_names.len();
 
         Ok(Self {
-            writer,
             feature_names,
             prev_values: None,
-            record,
             rows_written: 0,
+            // Pre-allocate to avoid reallocation overhead (100_000 hours ≈ 11.4 years)
+            pencere_ids: Vec::with_capacity(100_000),
+            zaman_dks: Vec::with_capacity(100_000),
+            feature_cols: vec![Vec::with_capacity(100_000); num_features],
+            dev_cols: vec![Vec::with_capacity(100_000); num_features],
         })
     }
 
@@ -54,32 +49,39 @@ impl FeatureWriter {
         time_min: f64,
         features: &HashMap<&'static str, f64>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.record.clear();
-
-        self.record.push_field(window_id);
-        self.record.push_field(&format!("{:.6}", time_min));
+        self.pencere_ids.push(window_id.to_string());
+        self.zaman_dks.push(time_min);
 
         let mut current_values = Vec::with_capacity(self.feature_names.len());
-        for name in &self.feature_names {
+
+        for (i, name) in self.feature_names.iter().enumerate() {
             let v = features.get(name).copied().unwrap_or(f64::NAN);
             current_values.push(v);
-            push_formatted_value(&mut self.record, v);
+
+            // Map NaN to None so Parquet records a true NULL
+            // (matches the old logic of pushing an empty string "")
+            let v_opt = if v.is_nan() { None } else { Some(v) };
+            self.feature_cols[i].push(v_opt);
         }
 
         match &self.prev_values {
             Some(prev) => {
-                for (&v, &p) in current_values.iter().zip(prev.iter()) {
-                    push_formatted_value(&mut self.record, v - p);
+                for (i, (&v, &p)) in current_values.iter().zip(prev.iter()).enumerate() {
+                    let dev = if v.is_nan() || p.is_nan() {
+                        None
+                    } else {
+                        Some(v - p)
+                    };
+                    self.dev_cols[i].push(dev);
                 }
             }
             None => {
-                for _ in 0..self.feature_names.len() {
-                    self.record.push_field("");
+                for i in 0..self.feature_names.len() {
+                    self.dev_cols[i].push(None); // First row has no previous data
                 }
             }
         }
 
-        self.writer.write_record(&self.record)?;
         self.prev_values = Some(current_values);
         self.rows_written += 1;
         Ok(())
@@ -90,18 +92,32 @@ impl FeatureWriter {
         output_path: &Path,
         config: &AppConfig,
     ) -> Result<usize, Box<dyn std::error::Error>> {
-        self.writer.flush()?;
-        let metadata_path = output_path.with_extension("run_metadata.json");
-        config.save_to_json(&metadata_path)?;
-        Ok(self.rows_written)
-    }
-}
+        let parquet_path = output_path.with_extension("parquet");
 
-#[inline(always)]
-fn push_formatted_value(record: &mut StringRecord, v: f64) {
-    if v.is_nan() {
-        record.push_field("");
-    } else {
-        record.push_field(&format!("{:.6}", v));
+        let mut columns = Vec::new();
+
+        columns.push(Series::new("Pencere_ID".into(), &self.pencere_ids));
+        columns.push(Series::new("Zaman_Dk".into(), &self.zaman_dks));
+
+        for (i, name) in self.feature_names.iter().enumerate() {
+            columns.push(Series::new((*name).into(), &self.feature_cols[i]));
+        }
+
+        for (i, name) in self.feature_names.iter().enumerate() {
+            let dev_name = format!("{}_DEV", name);
+            columns.push(Series::new(dev_name.as_str().into(), &self.dev_cols[i]));
+        }
+
+        let mut df = DataFrame::new(columns)?;
+
+        let file = File::create(&parquet_path)?;
+        ParquetWriter::new(file)
+            .with_compression(ParquetCompression::Zstd(None)) // Zstd compression
+            .finish(&mut df)?;
+
+        let metadata_path = parquet_path.with_extension("run_metadata.json");
+        config.save_to_json(&metadata_path)?;
+
+        Ok(self.rows_written)
     }
 }

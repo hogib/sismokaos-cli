@@ -23,9 +23,9 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "output".to_string());
-    let csv_path = config
+    let parquet_path = config
         .output_root
-        .join(format!("{}_features.csv", file_stem));
+        .join(format!("{}_features.parquet", file_stem));
 
     let (chunk_tx, chunk_rx) = sync_channel::<ChannelChunk>(2);
 
@@ -107,8 +107,8 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
             let w = match writer.as_mut() {
                 Some(w) => w,
                 None => {
-                    let new_writer = FeatureWriter::new(&csv_path, &features)
-                        .map_err(|e| format!("Failed to create output CSV: {}", e))?;
+                    let new_writer = FeatureWriter::new(&parquet_path, &features)
+                        .map_err(|e| format!("Failed to create output parquet: {}", e))?;
                     writer = Some(new_writer);
                     writer.as_mut().unwrap()
                 }
@@ -116,7 +116,7 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
 
             let window_id = format!("{}_w{:02}", file_stem, window_idx + 1);
             w.write_window(&window_id, time_minutes, &features)
-                .map_err(|e| format!("Failed to write CSV row: {}", e))?;
+                .map_err(|e| format!("Failed to write parquet row: {}", e))?;
 
             let _ = progress_tx.send(PipelineEvent::WindowProcessed);
             window_idx += 1;
@@ -145,7 +145,7 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         Some(w) => {
             let mut final_config = config.clone();
             final_config.fs = fs_out;
-            w.finish(&csv_path, &final_config)
+            w.finish(&parquet_path, &final_config)
                 .map_err(|e| format!("Failed to finalize output: {}", e))?;
             let _ = progress_tx.send(PipelineEvent::Completed);
         }
