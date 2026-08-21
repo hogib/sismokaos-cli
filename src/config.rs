@@ -2,6 +2,31 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn default_chaos_tau() -> usize {
+    5
+}
+fn default_chaos_dim() -> usize {
+    5
+}
+fn default_chaos_evolve() -> usize {
+    5
+}
+fn default_chaos_min_samples() -> usize {
+    500
+}
+fn default_chaos_slope_ros() -> [f64; 4] {
+    [0.5, 5.0, 5.0, 20.0]
+}
+fn default_chaos_mean_period() -> f64 {
+    1.0
+}
+fn default_chaos_sampent_m() -> usize {
+    2
+}
+fn default_chaos_sampent_r() -> f64 {
+    0.2
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
     pub station: String,
@@ -12,6 +37,27 @@ pub struct AppConfig {
     pub lta_sec: u32,
     pub freqmin: f64,
     pub freqmax: f64,
+
+    // Chaotic feature parameters (Wolf/Rosenstein Lyapunov exponents, Sample
+    // Entropy, Correlation Dimension) -- see src/features/chaos.rs. Each has
+    // a `#[serde(default = ...)]` so existing config.json files written
+    // before these fields existed keep loading instead of erroring out.
+    #[serde(default = "default_chaos_tau")]
+    pub chaos_tau: usize,
+    #[serde(default = "default_chaos_dim")]
+    pub chaos_dim: usize,
+    #[serde(default = "default_chaos_evolve")]
+    pub chaos_evolve: usize,
+    #[serde(default = "default_chaos_min_samples")]
+    pub chaos_min_samples: usize,
+    #[serde(default = "default_chaos_slope_ros")]
+    pub chaos_slope_ros: [f64; 4],
+    #[serde(default = "default_chaos_mean_period")]
+    pub chaos_mean_period: f64,
+    #[serde(default = "default_chaos_sampent_m")]
+    pub chaos_sampent_m: usize,
+    #[serde(default = "default_chaos_sampent_r")]
+    pub chaos_sampent_r: f64,
 
     // Derived fields (calculated after loading, so we skip them during JSON parsing)
     #[serde(skip)]
@@ -35,6 +81,14 @@ impl Default for AppConfig {
             lta_sec: 60,
             freqmin: 0.1,
             freqmax: 2.0,
+            chaos_tau: default_chaos_tau(),
+            chaos_dim: default_chaos_dim(),
+            chaos_evolve: default_chaos_evolve(),
+            chaos_min_samples: default_chaos_min_samples(),
+            chaos_slope_ros: default_chaos_slope_ros(),
+            chaos_mean_period: default_chaos_mean_period(),
+            chaos_sampent_m: default_chaos_sampent_m(),
+            chaos_sampent_r: default_chaos_sampent_r(),
             data_dir: PathBuf::new(),
             output_root: PathBuf::new(),
             win_size: 0,

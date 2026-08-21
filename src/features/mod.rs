@@ -1,3 +1,4 @@
+pub mod chaos;
 pub mod cross;
 pub mod math;
 
@@ -48,6 +49,11 @@ pub fn compute_window(
                 "E_HJORTH_MOBILITY",
                 "E_HJORTH_COMPLEXITY",
                 "E_PERMUTATION_ENTROPY",
+                "E_WOLF_LYE",
+                "E_ROS_SHORT",
+                "E_ROS_LONG",
+                "E_SAMP_ENT",
+                "E_CORR_DIM",
             ],
         ),
         (
@@ -69,6 +75,11 @@ pub fn compute_window(
                 "N_HJORTH_MOBILITY",
                 "N_HJORTH_COMPLEXITY",
                 "N_PERMUTATION_ENTROPY",
+                "N_WOLF_LYE",
+                "N_ROS_SHORT",
+                "N_ROS_LONG",
+                "N_SAMP_ENT",
+                "N_CORR_DIM",
             ],
         ),
         (
@@ -90,6 +101,11 @@ pub fn compute_window(
                 "Z_HJORTH_MOBILITY",
                 "Z_HJORTH_COMPLEXITY",
                 "Z_PERMUTATION_ENTROPY",
+                "Z_WOLF_LYE",
+                "Z_ROS_SHORT",
+                "Z_ROS_LONG",
+                "Z_SAMP_ENT",
+                "Z_CORR_DIM",
             ],
         ),
     ];
@@ -169,6 +185,37 @@ pub fn compute_window(
         result.insert(keys[13], mob);
         result.insert(keys[14], cx);
         result.insert(keys[15], entropy);
+
+        // --- Chaotic metrics (Wolf/Rosenstein Lyapunov exponents, Sample
+        // Entropy, Correlation Dimension) ---
+        // Wolf/Rosenstein need enough samples to embed and evolve reliably;
+        // below that threshold they report NaN rather than a noisy estimate,
+        // matching the Python sibling project's CHAOS_MIN_SAMPLES guard.
+        let wolf_lye = if seg_norm.len() >= config.chaos_min_samples {
+            chaos::wolf_lye(&seg_norm, config.fs, config.chaos_tau, config.chaos_dim, config.chaos_evolve)
+        } else {
+            f64::NAN
+        };
+        let (ros_short, ros_long) = if seg_norm.len() >= config.chaos_min_samples {
+            chaos::rosenstein_lye(
+                &seg_norm,
+                config.fs,
+                config.chaos_tau,
+                config.chaos_dim,
+                config.chaos_slope_ros,
+                config.chaos_mean_period,
+            )
+        } else {
+            (f64::NAN, f64::NAN)
+        };
+        let samp_ent = chaos::sample_entropy(&seg_norm, config.chaos_sampent_m, config.chaos_sampent_r);
+        let corr_dim = chaos::correlation_dimension(&seg_norm, config.chaos_tau, config.chaos_dim);
+
+        result.insert(keys[16], wolf_lye);
+        result.insert(keys[17], ros_short);
+        result.insert(keys[18], ros_long);
+        result.insert(keys[19], samp_ent);
+        result.insert(keys[20], corr_dim);
     }
 
     result
