@@ -46,6 +46,11 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
     let mut buf_n: VecDeque<f64> = VecDeque::new();
     let mut buf_z: VecDeque<f64> = VecDeque::new();
 
+    // Interpolation masks, buffered in lockstep with the samples they describe.
+    let mut buf_e_interp: VecDeque<bool> = VecDeque::new();
+    let mut buf_n_interp: VecDeque<bool> = VecDeque::new();
+    let mut buf_z_interp: VecDeque<bool> = VecDeque::new();
+
     let mut global_offset: usize = 0;
     let mut window_idx: usize = 0;
     let mut fs_out = config.fs;
@@ -64,11 +69,27 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
             buf_e.clear();
             buf_n.clear();
             buf_z.clear();
+            buf_e_interp.clear();
+            buf_n_interp.clear();
+            buf_z_interp.clear();
             current_buffer_epoch = chunk.start_epoch;
         }
         buf_e.extend(chunk.e);
         buf_n.extend(chunk.n);
         buf_z.extend(chunk.z);
+        buf_e_interp.extend(chunk.e_interp);
+        buf_n_interp.extend(chunk.n_interp);
+        buf_z_interp.extend(chunk.z_interp);
+
+        // The masks are buffered separately from the samples, so a length
+        // mismatch would mis-attribute interpolation to the wrong windows from
+        // here on rather than failing. Make it fail.
+        assert!(
+            buf_e.len() == buf_e_interp.len()
+                && buf_n.len() == buf_n_interp.len()
+                && buf_z.len() == buf_z_interp.len(),
+            "interpolation mask buffers desynchronised from sample buffers"
+        );
 
         let mut starts = Vec::new();
         let mut cursor = 0usize;
@@ -84,9 +105,19 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
         let slice_e = buf_e.make_contiguous();
         let slice_n = buf_n.make_contiguous();
         let slice_z = buf_z.make_contiguous();
+        let slice_e_interp = buf_e_interp.make_contiguous();
+        let slice_n_interp = buf_n_interp.make_contiguous();
+        let slice_z_interp = buf_z_interp.make_contiguous();
+
+        let interp_fraction = |mask: &[bool]| -> f64 {
+            if mask.is_empty() {
+                return 0.0;
+            }
+            mask.iter().filter(|&&b| b).count() as f64 / mask.len() as f64
+        };
 
         // Data-parallel feature computation for all windows in this chunk
-        let chunk_results: Vec<(f64, HashMap<&'static str, f64>)> = starts
+        let chunk_results: Vec<(f64, HashMap<&'static str, f64>, [f64; 3])> = starts
             .par_iter()
             .map(|&start| {
                 let end = start + config.win_size;
@@ -99,11 +130,19 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
                     &slice_z[start..end],
                     &per_window_config,
                 );
-                (time_minutes, window_features)
+                // Reported per component rather than pooled: the chaotic
+                // features are per component too, so `Z_CORR_DIM` is filterable
+                // against the fraction of the Z channel that was fabricated.
+                let interp = [
+                    interp_fraction(&slice_e_interp[start..end]),
+                    interp_fraction(&slice_n_interp[start..end]),
+                    interp_fraction(&slice_z_interp[start..end]),
+                ];
+                (time_minutes, window_features, interp)
             })
             .collect();
 
-        for (time_minutes, features) in chunk_results {
+        for (time_minutes, features, interp) in chunk_results {
             let w = match writer.as_mut() {
                 Some(w) => w,
                 None => {
@@ -115,7 +154,7 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
             };
 
             let window_id = format!("{}_w{:02}", file_stem, window_idx + 1);
-            w.write_window(&window_id, time_minutes, &features)
+            w.write_window(&window_id, time_minutes, &features, interp)
                 .map_err(|e| format!("Failed to write parquet row: {}", e))?;
 
             let _ = progress_tx.send(PipelineEvent::WindowProcessed);
@@ -127,6 +166,9 @@ pub fn run_pipeline(config: AppConfig, progress_tx: Sender<PipelineEvent>) -> Re
             buf_e.drain(0..cursor);
             buf_n.drain(0..cursor);
             buf_z.drain(0..cursor);
+            buf_e_interp.drain(0..cursor);
+            buf_n_interp.drain(0..cursor);
+            buf_z_interp.drain(0..cursor);
             current_buffer_epoch += cursor as f64 / fs_out;
             global_offset += cursor;
         }

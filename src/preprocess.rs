@@ -21,6 +21,18 @@ pub struct ChannelChunk {
     pub e: Vec<f64>,
     pub n: Vec<f64>,
     pub z: Vec<f64>,
+    /// Per-sample flags aligned 1:1 with `e`/`n`/`z`, marking samples the gap
+    /// interpolant fabricated.
+    ///
+    /// `interpolate_gaps` fills interior gaps and leaves only *edge* gaps as
+    /// NaN, so a reconstructed sample is indistinguishable from a recorded one
+    /// downstream -- and a flat interpolated segment genuinely is
+    /// low-dimensional, so the chaotic estimators return small, confident,
+    /// entirely fictional values for it. Carrying the mask alongside the data
+    /// is what makes those windows filterable after the fact.
+    pub e_interp: Vec<bool>,
+    pub n_interp: Vec<bool>,
+    pub z_interp: Vec<bool>,
     pub fs: f64,
     pub start_epoch: f64,
 }
@@ -226,7 +238,7 @@ fn flush_block(
 
     let phase = (decimation_factor - (asm.global_offset % decimation_factor)) % decimation_factor;
 
-    let processed_results: Result<Vec<(char, Vec<f64>)>, String> = COMPONENTS
+    let processed_results: Result<Vec<(char, (Vec<f64>, Vec<bool>))>, String> = COMPONENTS
         .par_iter()
         .map(|&comp| {
             SCRATCH_BUF.with(|cell| {
@@ -254,12 +266,18 @@ fn flush_block(
         })
         .collect();
 
-    let mut out: HashMap<char, Vec<f64>> = processed_results?.into_iter().collect();
+    let mut out: HashMap<char, (Vec<f64>, Vec<bool>)> = processed_results?.into_iter().collect();
+    let (e, e_interp) = out.remove(&'E').unwrap();
+    let (n, n_interp) = out.remove(&'N').unwrap();
+    let (z, z_interp) = out.remove(&'Z').unwrap();
 
     on_chunk(ChannelChunk {
-        e: out.remove(&'E').unwrap(),
-        n: out.remove(&'N').unwrap(),
-        z: out.remove(&'Z').unwrap(),
+        e,
+        n,
+        z,
+        e_interp,
+        n_interp,
+        z_interp,
         fs: out_fs,
         start_epoch: asm.start_epoch,
     })?;
@@ -603,6 +621,9 @@ fn detrend_linear(data: &mut [f64]) {
     }
 }
 
+/// Returns the processed samples together with a per-sample flag marking which
+/// of them the gap interpolant fabricated. Both are decimated identically, so
+/// they stay index-aligned.
 fn process_component(
     data: &mut Vec<f64>,
     freqmin: f64,
@@ -610,12 +631,33 @@ fn process_component(
     fs: f64,
     decimation_factor: usize,
     skip: usize,
-) -> Result<Vec<f64>, String> {
+) -> Result<(Vec<f64>, Vec<bool>), String> {
     if data.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
+    // Captured between the interpolant and everything downstream, because this
+    // is the only point where "was NaN, now is not" means exactly "fabricated
+    // by the interpolant". Edge gaps are still NaN here and stay NaN in the
+    // output -- they are already visible, so they are not counted as
+    // interpolated.
+    let had_nan = data.iter().any(|v| v.is_nan());
+    let was_nan: Vec<bool> = if had_nan {
+        data.iter().map(|v| v.is_nan()).collect()
+    } else {
+        Vec::new()
+    };
     interpolate_gaps(data);
+    let interpolated: Vec<bool> = if had_nan {
+        was_nan
+            .iter()
+            .zip(data.iter())
+            .map(|(&w, v)| w && !v.is_nan())
+            .collect()
+    } else {
+        vec![false; data.len()]
+    };
+
     detrend_linear(data);
 
     let mut missing = Vec::new();
@@ -628,7 +670,7 @@ fn process_component(
 
     if missing.len() == data.len() {
         let kept = data.len().saturating_sub(skip).div_ceil(decimation_factor);
-        return Ok(vec![f64::NAN; kept]);
+        return Ok((vec![f64::NAN; kept], vec![false; kept]));
     }
 
     let filter =
@@ -639,12 +681,27 @@ fn process_component(
         filtered[i] = f64::NAN;
     }
 
+    // A mask shorter than its data would not panic -- `engine.rs` buffers the
+    // two independently -- it would silently desynchronise and mis-attribute
+    // every window after the first short chunk. Assert instead.
+    assert_eq!(
+        filtered.len(),
+        interpolated.len(),
+        "interpolation mask desynchronised from filtered samples"
+    );
     let skip = skip.min(filtered.len());
-    Ok(filtered[skip..]
+    let out: Vec<f64> = filtered[skip..]
         .iter()
         .step_by(decimation_factor)
         .copied()
-        .collect())
+        .collect();
+    let mask: Vec<bool> = interpolated[skip..]
+        .iter()
+        .step_by(decimation_factor)
+        .copied()
+        .collect();
+    assert_eq!(out.len(), mask.len());
+    Ok((out, mask))
 }
 
 #[cfg(test)]
@@ -655,6 +712,83 @@ mod tests {
         (0..n)
             .map(|i| (i as f64 / n as f64 * 4.0 * std::f64::consts::PI).sin() * amp)
             .collect()
+    }
+
+    /// A window whose samples were fabricated by the gap interpolant has to be
+    /// identifiable afterwards. Without the mask a flat reconstructed segment
+    /// reads as a confident low-dimensional chaos measurement, and nothing in
+    /// the feature table distinguishes it from real quiet ground.
+    #[test]
+    fn interior_gaps_are_reported_as_interpolated() {
+        let mut data = sine(1000, 100.0);
+        for v in data.iter_mut().take(320).skip(300) {
+            *v = f64::NAN;
+        }
+
+        let (out, mask) = process_component(&mut data, 1.0, 20.0, 100.0, 1, 0).unwrap();
+
+        assert_eq!(out.len(), mask.len());
+        assert!(
+            mask[300..320].iter().all(|&b| b),
+            "every filled sample should be flagged"
+        );
+        assert_eq!(
+            mask.iter().filter(|&&b| b).count(),
+            20,
+            "nothing outside the gap should be flagged"
+        );
+    }
+
+    /// Edge gaps survive as NaN in the output, so they are already visible and
+    /// must not be double-counted as fabricated data.
+    #[test]
+    fn edge_gaps_are_not_counted_as_interpolated() {
+        let mut data = sine(1000, 100.0);
+        for v in data.iter_mut().take(5) {
+            *v = f64::NAN;
+        }
+        for v in data.iter_mut().skip(995) {
+            *v = f64::NAN;
+        }
+
+        let (out, mask) = process_component(&mut data, 1.0, 20.0, 100.0, 1, 0).unwrap();
+
+        assert!(mask.iter().all(|&b| !b), "edge gaps are not interpolated");
+        assert!(out[..5].iter().all(|v| v.is_nan()), "edge gaps stay NaN");
+    }
+
+    /// A clean trace must report exactly zero, not an empty or absent mask.
+    #[test]
+    fn clean_data_reports_no_interpolation() {
+        let mut data = sine(1000, 100.0);
+        let (out, mask) = process_component(&mut data, 1.0, 20.0, 100.0, 1, 0).unwrap();
+        assert_eq!(out.len(), mask.len());
+        assert!(mask.iter().all(|&b| !b));
+    }
+
+    /// The mask is decimated by the same slice-and-stride as the samples. If it
+    /// were not, it would stay the same length as the raw input and silently
+    /// describe the wrong samples from the first chunk onward.
+    #[test]
+    fn mask_survives_decimation_in_alignment() {
+        for (factor, skip) in [(1usize, 0usize), (5, 0), (5, 7), (20, 13)] {
+            let mut data = sine(1000, 100.0);
+            for v in data.iter_mut().take(520).skip(500) {
+                *v = f64::NAN;
+            }
+            let (out, mask) = process_component(&mut data, 1.0, 20.0, 100.0, factor, skip).unwrap();
+
+            assert_eq!(out.len(), mask.len(), "factor={factor} skip={skip}");
+            // Every flagged output index must map back into the original gap.
+            for (i, &flagged) in mask.iter().enumerate() {
+                let src = skip + i * factor;
+                assert_eq!(
+                    flagged,
+                    (500..520).contains(&src),
+                    "factor={factor} skip={skip} out_idx={i} src={src}"
+                );
+            }
+        }
     }
 
     /// The interpolant must not invent amplitude that is not in the signal.

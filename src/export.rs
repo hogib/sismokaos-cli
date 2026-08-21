@@ -15,6 +15,12 @@ pub struct FeatureWriter {
     zaman_dks: Vec<f64>,
     feature_cols: Vec<Vec<Option<f64>>>,
     dev_cols: Vec<Vec<Option<f64>>>,
+
+    // Quality flags, deliberately NOT features: they are held apart from
+    // `feature_names` so they get no `_DEV` twin (a first difference of a
+    // gap fraction is meaningless) and so adding them cannot perturb the
+    // `_DEV` diffing of any real feature.
+    interp_cols: [Vec<f64>; 3],
 }
 
 impl FeatureWriter {
@@ -40,6 +46,14 @@ impl FeatureWriter {
             zaman_dks: Vec::with_capacity(100_000),
             feature_cols: vec![Vec::with_capacity(100_000); num_features],
             dev_cols: vec![Vec::with_capacity(100_000); num_features],
+            // Constructed unconditionally, so a run whose first window happens
+            // to be gap-free produces the same schema as one whose first
+            // window is not.
+            interp_cols: [
+                Vec::with_capacity(100_000),
+                Vec::with_capacity(100_000),
+                Vec::with_capacity(100_000),
+            ],
         })
     }
 
@@ -48,9 +62,13 @@ impl FeatureWriter {
         window_id: &str,
         time_min: f64,
         features: &HashMap<&'static str, f64>,
+        interp: [f64; 3],
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.pencere_ids.push(window_id.to_string());
         self.zaman_dks.push(time_min);
+        for (col, v) in self.interp_cols.iter_mut().zip(interp) {
+            col.push(v);
+        }
 
         let mut current_values = Vec::with_capacity(self.feature_names.len());
 
@@ -106,6 +124,17 @@ impl FeatureWriter {
         for (i, name) in self.feature_names.iter().enumerate() {
             let dev_name = format!("{}_DEV", name);
             columns.push(Series::new(dev_name.as_str().into(), &self.dev_cols[i]));
+        }
+
+        // Fraction of each component's samples in the window that the gap
+        // interpolant fabricated. Without these a reconstructed window is
+        // indistinguishable from a recorded one, and a flat interpolated
+        // segment reads as a confident low-dimensional chaos measurement.
+        for (name, col) in ["E_INTERP_FRAC", "N_INTERP_FRAC", "Z_INTERP_FRAC"]
+            .iter()
+            .zip(self.interp_cols.iter())
+        {
+            columns.push(Series::new((*name).into(), col));
         }
 
         let mut df = DataFrame::new(columns)?;
