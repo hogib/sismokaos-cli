@@ -233,48 +233,104 @@ pub fn rosenstein_lye(
 
     // Nearest neighbour (excluding a temporal band around the diagonal) for
     // every embedded point.
-    let mut ind2 = vec![0usize; m];
+    //
+    // The distance matrix is symmetric and `(a - b).powi(2) == (b - a).powi(2)`
+    // exactly in IEEE, so each unordered pair is evaluated once and used to
+    // update both of its rows -- half the distance work. Scan order is
+    // preserved: row `r` still sees its candidates in ascending index order
+    // (those below `r` arrive from earlier outer iterations, those above from
+    // outer iteration `r`), and the update stays strictly `<`, so the same
+    // first-minimum wins every tie the old loop did.
+    let mut best_idx = vec![usize::MAX; m];
+    let mut best_d = vec![f64::INFINITY; m];
     for i in 0..m {
-        let mut best_idx = usize::MAX;
-        let mut best_d = f64::INFINITY;
-        for k in 0..m {
-            if k.abs_diff(i) <= band {
-                continue;
+        let pi = point(i);
+        for k in (i + band + 1)..m {
+            let pk = point(k);
+            let mut d = 0.0f64;
+            for t in 0..dim {
+                let e = pi[t] - pk[t];
+                d += e * e;
             }
-            let d: f64 = point(i).iter().zip(point(k)).map(|(&a, &b)| (a - b).powi(2)).sum();
-            if d < best_d {
-                best_d = d;
-                best_idx = k;
+            if d < best_d[i] {
+                best_d[i] = d;
+                best_idx[i] = k;
+            }
+            if d < best_d[k] {
+                best_d[k] = d;
+                best_idx[k] = i;
             }
         }
-        ind2[i] = if best_idx == usize::MAX { i } else { best_idx };
     }
+    let mut ind2 = vec![0usize; m];
+    for i in 0..m {
+        ind2[i] = if best_idx[i] == usize::MAX { i } else { best_idx[i] };
+    }
+
+    let round_idx = |v: f64| -> usize { python_round(v * mean_period * fs).max(0.0) as usize };
+    let s_lo = if slope[0] == 0.0 { 0 } else { round_idx(slope[0]) };
+    let s_hi = round_idx(slope[1]);
+    let l_lo = round_idx(slope[2]);
+    let l_hi = round_idx(slope[3]);
 
     // Average log divergence at each evolution step j: average, over all
     // starting points i whose trajectory and its neighbour's both survive j
     // steps, of ln(distance after j steps).
+    //
+    // Only steps up to the largest index either slope window reads are needed.
+    // `jmax` is derived from the actual `slope`/`mean_period`/`fs` arguments
+    // rather than assumed, so a different sampling rate widens it correctly.
+    // At the 5 Hz default this computes 101 steps instead of `m` (~980), and
+    // the loop is triangular, so it is the bulk of the function's cost.
     let mut ave_ln_div = vec![0.0f64; m];
-    for j in 0..m {
-        let mut sum = 0.0;
-        let mut count = 0usize;
-        for i in 0..m {
-            let nn = ind2[i];
-            if i + j >= m || nn + j >= m {
-                continue;
-            }
-            let d: f64 = point(i + j).iter().zip(point(nn + j)).map(|(&a, &b)| (a - b).powi(2)).sum::<f64>().sqrt();
-            if d > 0.0 {
-                sum += d.ln();
-                count += 1;
-            }
-        }
-        ave_ln_div[j] = if count > 0 { sum / count as f64 } else { 0.0 };
-        if count == 0 {
-            break;
-        }
-    }
+    let jmax = s_hi.max(l_hi).min(m - 1);
 
-    let nz = ave_ln_div.iter().filter(|&&v| v != 0.0).count();
+    // Returns the step at which the average was undefined (count == 0), which
+    // is where the original loop broke out and left the tail zeroed.
+    let divergence = |ave_ln_div: &mut [f64], from: usize, to: usize| -> Option<usize> {
+        for j in from..=to {
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for i in 0..m {
+                let nn = ind2[i];
+                if i + j >= m || nn + j >= m {
+                    continue;
+                }
+                let d: f64 = point(i + j).iter().zip(point(nn + j)).map(|(&a, &b)| (a - b).powi(2)).sum::<f64>().sqrt();
+                if d > 0.0 {
+                    sum += d.ln();
+                    count += 1;
+                }
+            }
+            ave_ln_div[j] = if count > 0 { sum / count as f64 } else { 0.0 };
+            if count == 0 {
+                return Some(j);
+            }
+        }
+        None
+    };
+
+    let stopped = divergence(&mut ave_ln_div, 0, jmax);
+
+    // `nz` is only ever compared against `hi`, and `hi <= jmax`. If the loop
+    // ran to `jmax` without a zero, the true `nz` is at least `jmax + 1`, so
+    // the lower bound decides `hi > nz` identically to the exact count. If it
+    // stopped early the tail is all zeros and the count over the computed
+    // prefix *is* exact. The remaining case -- a zero average at a step where
+    // `count > 0` -- cannot be bounded, so it falls back to the full sweep.
+    let prefix_zero = ave_ln_div[..=jmax].iter().any(|&v| v == 0.0);
+    let nz = if stopped.is_none() && !prefix_zero {
+        jmax + 1
+    } else {
+        // Either the sweep stopped early -- in which case the tail is zeroed
+        // exactly as the original left it -- or a step averaged to zero without
+        // stopping, which no bound covers, so the rest is computed after all.
+        if stopped.is_none() && jmax + 1 < m {
+            divergence(&mut ave_ln_div, jmax + 1, m - 1);
+        }
+        ave_ln_div.iter().filter(|&&v| v != 0.0).count()
+    };
+
     let time: Vec<f64> = (0..m).map(|i| i as f64 / fs / mean_period).collect();
 
     let fit = |lo: usize, hi: usize| -> f64 {
@@ -283,12 +339,6 @@ pub fn rosenstein_lye(
         }
         linear_regression_slope(&time[lo..=hi], &ave_ln_div[lo..=hi])
     };
-
-    let round_idx = |v: f64| -> usize { python_round(v * mean_period * fs).max(0.0) as usize };
-    let s_lo = if slope[0] == 0.0 { 0 } else { round_idx(slope[0]) };
-    let s_hi = round_idx(slope[1]);
-    let l_lo = round_idx(slope[2]);
-    let l_hi = round_idx(slope[3]);
 
     (fit(s_lo, s_hi), fit(l_lo, l_hi))
 }
@@ -412,40 +462,38 @@ pub fn correlation_dimension(x: &[f64], tau: usize, de: usize) -> f64 {
     }
     let pair_count = sample_count - k - 1;
 
-    // Every pair distance is used twice: once to find the eps range, once to
-    // bin. Computing them into a flat triangular buffer trades ~3.6 MB per
-    // call for halving the distance work and dropping the per-row allocation.
-    let mut row_start = Vec::with_capacity(pair_count + 1);
+    // Pass 1 keeps *squared* distances. `sqrt` is monotonic and correctly
+    // rounded, so min/max commute with it -- taking the root of the extremes
+    // gives bit-identical `eps1`/`eps2` while deferring 455k square roots to
+    // the single pass that actually needs them.
     let mut total = 0usize;
     for i in 0..pair_count {
-        row_start.push(total);
         total += sample_count - (i + k + 1);
     }
-    row_start.push(total);
 
-    let mut dists = vec![0.0f64; total];
-    let mut eps1 = 0.0f64;
-    let mut eps2 = f64::INFINITY;
+    let mut dists = Vec::with_capacity(total);
+    let mut max_sq = 0.0f64;
+    let mut min_sq = f64::INFINITY;
     for i in 0..pair_count {
         let pi = point(i);
-        let base = row_start[i];
-        for (o, j) in (i + k + 1..sample_count).enumerate() {
+        for j in i + k + 1..sample_count {
             let pj = point(j);
             let mut acc = 0.0;
             for t in 0..de {
                 let d = pi[t] - pj[t];
                 acc += d * d;
             }
-            let d = acc.sqrt();
-            dists[base + o] = d;
-            if d > eps1 {
-                eps1 = d;
+            dists.push(acc);
+            if acc > max_sq {
+                max_sq = acc;
             }
-            if d < eps2 {
-                eps2 = d;
+            if acc < min_sq {
+                min_sq = acc;
             }
         }
     }
+    let eps1 = max_sq.sqrt();
+    let mut eps2 = min_sq.sqrt();
     if eps2 == 0.0 {
         eps2 = f64::EPSILON;
     }
@@ -459,15 +507,22 @@ pub fn correlation_dimension(x: &[f64], tau: usize, de: usize) -> f64 {
         .map(|b| (log_eps2 + (log_eps1 - log_eps2) * b as f64 / (bins - 1) as f64).exp())
         .collect();
 
+    // `ci` is a *global* histogram: the old per-row loop accumulated
+    // `count_b - count_{b-1}`, i.e. the number of that row's distances in
+    // `(epsilon[b-1], epsilon[b]]`, into a shared `ci[b]`. The row structure
+    // never affected the result, so each distance can be binned directly.
+    // `partition_point(|&e| e < d)` returns the first `b` with
+    // `epsilon[b] >= d` -- exactly the bin the sort-and-count assigned. A
+    // return of `bins` means `d > epsilon[bins-1]`, which the old code
+    // dropped implicitly (its per-row count never reached such a `d`); that
+    // is reachable because `epsilon[bins-1]` is `exp(ln(eps1))`, which can
+    // round just below `eps1` itself.
     let mut ci = vec![0.0f64; bins];
-    for i in 0..pair_count {
-        let sorted = &mut dists[row_start[i]..row_start[i + 1]];
-        sorted.sort_by(f64::total_cmp);
-        let mut prev_count = 0usize;
-        for (b, &e) in epsilon.iter().enumerate() {
-            let count = sorted.partition_point(|&d| d <= e);
-            ci[b] += (count - prev_count) as f64;
-            prev_count = count;
+    for &sq in dists.iter() {
+        let d = sq.sqrt();
+        let b = epsilon.partition_point(|&e| e < d);
+        if b < bins {
+            ci[b] += 1.0;
         }
     }
 
@@ -583,5 +638,363 @@ mod tests {
         assert!(s.is_nan() && l.is_nan());
         assert!(sample_entropy(&short, 2, 0.2).is_nan());
         assert_eq!(correlation_dimension(&short, 5, 5), 0.0);
+    }
+}
+
+/// Bit-parity harness for the optimised `correlation_dimension` and
+/// `rosenstein_lye`.
+///
+/// Both rewrites are performance-only: they must reproduce the pre-optimisation
+/// output *exactly*, because the feature corpus is extracted incrementally and a
+/// parquet written by an older binary has to stay comparable to one written by a
+/// newer one. Approximate agreement is not sufficient for that, so these tests
+/// hold the original implementations verbatim and compare raw bit patterns.
+#[cfg(test)]
+mod parity {
+    #![allow(clippy::needless_range_loop)]
+    use super::*;
+
+    fn correlation_dimension_ref(x: &[f64], tau: usize, de: usize) -> f64 {
+        let n = x.len();
+        if de == 0 || (de - 1) * tau >= n {
+            return 0.0;
+        }
+        let sample_count = n - (de - 1) * tau;
+        if sample_count == 0 {
+            return 0.0;
+        }
+
+        // Row-major embedding, so point `idx` is the contiguous slice
+        // `y[idx * de .. idx * de + de]`. The layout used to be column-major, which
+        // meant reading one point had to gather `de` strided elements into a fresh
+        // `Vec` -- inside a loop that runs once per *pair*, i.e. ~455k allocations
+        // per component per window at the 200 s / 5 Hz configuration.
+        let mut y = vec![0.0; de * sample_count];
+        for j in 0..sample_count {
+            for i in 0..de {
+                y[j * de + i] = x[i * tau + j];
+            }
+        }
+        let point = |idx: usize| -> &[f64] { &y[idx * de..idx * de + de] };
+
+        let bins = 200usize;
+        let k = de * tau;
+        if k + 1 >= sample_count {
+            return 0.0;
+        }
+        let pair_count = sample_count - k - 1;
+
+        // Every pair distance is used twice: once to find the eps range, once to
+        // bin. Computing them into a flat triangular buffer trades ~3.6 MB per
+        // call for halving the distance work and dropping the per-row allocation.
+        let mut row_start = Vec::with_capacity(pair_count + 1);
+        let mut total = 0usize;
+        for i in 0..pair_count {
+            row_start.push(total);
+            total += sample_count - (i + k + 1);
+        }
+        row_start.push(total);
+
+        let mut dists = vec![0.0f64; total];
+        let mut eps1 = 0.0f64;
+        let mut eps2 = f64::INFINITY;
+        for i in 0..pair_count {
+            let pi = point(i);
+            let base = row_start[i];
+            for (o, j) in (i + k + 1..sample_count).enumerate() {
+                let pj = point(j);
+                let mut acc = 0.0;
+                for t in 0..de {
+                    let d = pi[t] - pj[t];
+                    acc += d * d;
+                }
+                let d = acc.sqrt();
+                dists[base + o] = d;
+                if d > eps1 {
+                    eps1 = d;
+                }
+                if d < eps2 {
+                    eps2 = d;
+                }
+            }
+        }
+        if eps2 == 0.0 {
+            eps2 = f64::EPSILON;
+        }
+        if eps1 <= eps2 {
+            return 0.0;
+        }
+
+        let log_eps2 = eps2.ln();
+        let log_eps1 = eps1.ln();
+        let epsilon: Vec<f64> = (0..bins)
+            .map(|b| (log_eps2 + (log_eps1 - log_eps2) * b as f64 / (bins - 1) as f64).exp())
+            .collect();
+
+        let mut ci = vec![0.0f64; bins];
+        for i in 0..pair_count {
+            let sorted = &mut dists[row_start[i]..row_start[i + 1]];
+            sorted.sort_by(f64::total_cmp);
+            let mut prev_count = 0usize;
+            for (b, &e) in epsilon.iter().enumerate() {
+                let count = sorted.partition_point(|&d| d <= e);
+                ci[b] += (count - prev_count) as f64;
+                prev_count = count;
+            }
+        }
+
+        // Cumulative sum -> correlation integral -> log-log curve.
+        let denom = (sample_count - k) as f64 * (sample_count - k) as f64;
+        let mut cum = 0.0;
+        let mut curve = vec![f64::NAN; bins];
+        for b in 0..bins {
+            cum += ci[b];
+            if cum > 0.0 {
+                curve[b] = (cum / denom).ln() + ((sample_count - k - 1) as f64).ln();
+            }
+        }
+        let log_eps: Vec<f64> = epsilon.iter().map(|e| e.ln()).collect();
+
+        let finite: Vec<(f64, f64)> = log_eps
+            .iter()
+            .zip(curve.iter())
+            .filter(|(_, v)| v.is_finite())
+            .map(|(&e, &v)| (e, v))
+            .collect();
+        if finite.is_empty() {
+            return 0.0;
+        }
+
+        let lo = finite.iter().map(|&(_, v)| v).fold(f64::INFINITY, f64::min);
+        let hi = finite.iter().map(|&(_, v)| v).fold(f64::NEG_INFINITY, f64::max);
+        let mid = (lo + hi) / 2.0;
+        let q = (hi - lo) / 4.0;
+
+        let selected: Vec<(f64, f64)> = finite
+            .into_iter()
+            .filter(|&(_, v)| v > mid && v < mid + q)
+            .collect();
+        if selected.len() < 2 {
+            return 0.0;
+        }
+
+        let xs: Vec<f64> = selected.iter().map(|&(e, _)| e).collect();
+        let ys: Vec<f64> = selected.iter().map(|&(_, v)| v).collect();
+        linear_regression_slope(&xs, &ys)
+    }
+
+    fn rosenstein_lye_ref(
+        x: &[f64],
+        fs: f64,
+        tau: usize,
+        dim: usize,
+        slope: [f64; 4],
+        mean_period: f64,
+    ) -> (f64, f64) {
+        let n = x.len();
+        if dim == 0 || (dim - 1) * tau >= n {
+            return (f64::NAN, f64::NAN);
+        }
+        let m = n - (dim - 1) * tau;
+        if m < 2 {
+            return (f64::NAN, f64::NAN);
+        }
+
+        let mut y = vec![0.0; m * dim];
+        for j in 0..dim {
+            for i in 0..m {
+                y[i * dim + j] = x[j * tau + i];
+            }
+        }
+        let point = |idx: usize| -> &[f64] { &y[idx * dim..idx * dim + dim] };
+
+        let band = (dim - 1) * tau;
+
+        // Nearest neighbour (excluding a temporal band around the diagonal) for
+        // every embedded point.
+        let mut ind2 = vec![0usize; m];
+        for i in 0..m {
+            let mut best_idx = usize::MAX;
+            let mut best_d = f64::INFINITY;
+            for k in 0..m {
+                if k.abs_diff(i) <= band {
+                    continue;
+                }
+                let d: f64 = point(i).iter().zip(point(k)).map(|(&a, &b)| (a - b).powi(2)).sum();
+                if d < best_d {
+                    best_d = d;
+                    best_idx = k;
+                }
+            }
+            ind2[i] = if best_idx == usize::MAX { i } else { best_idx };
+        }
+
+        // Average log divergence at each evolution step j: average, over all
+        // starting points i whose trajectory and its neighbour's both survive j
+        // steps, of ln(distance after j steps).
+        let mut ave_ln_div = vec![0.0f64; m];
+        for j in 0..m {
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for i in 0..m {
+                let nn = ind2[i];
+                if i + j >= m || nn + j >= m {
+                    continue;
+                }
+                let d: f64 = point(i + j).iter().zip(point(nn + j)).map(|(&a, &b)| (a - b).powi(2)).sum::<f64>().sqrt();
+                if d > 0.0 {
+                    sum += d.ln();
+                    count += 1;
+                }
+            }
+            ave_ln_div[j] = if count > 0 { sum / count as f64 } else { 0.0 };
+            if count == 0 {
+                break;
+            }
+        }
+
+        let nz = ave_ln_div.iter().filter(|&&v| v != 0.0).count();
+        let time: Vec<f64> = (0..m).map(|i| i as f64 / fs / mean_period).collect();
+
+        let fit = |lo: usize, hi: usize| -> f64 {
+            if hi >= ave_ln_div.len() || hi > nz || lo > hi {
+                return f64::NAN;
+            }
+            linear_regression_slope(&time[lo..=hi], &ave_ln_div[lo..=hi])
+        };
+
+        let round_idx = |v: f64| -> usize { python_round(v * mean_period * fs).max(0.0) as usize };
+        let s_lo = if slope[0] == 0.0 { 0 } else { round_idx(slope[0]) };
+        let s_hi = round_idx(slope[1]);
+        let l_lo = round_idx(slope[2]);
+        let l_hi = round_idx(slope[3]);
+
+        (fit(s_lo, s_hi), fit(l_lo, l_hi))
+    }
+
+    /// Bit-identical, treating any two NaNs as equal (the sign and payload of a
+    /// NaN produced by a division is not part of the contract here).
+    fn same(a: f64, b: f64) -> bool {
+        (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+    }
+
+    fn zscore(mut v: Vec<f64>) -> Vec<f64> {
+        let n = v.len() as f64;
+        let mean = v.iter().sum::<f64>() / n;
+        let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+        if sd > 0.0 {
+            for x in v.iter_mut() {
+                *x = (*x - mean) / sd;
+            }
+        }
+        v
+    }
+
+    fn lcg(seed: u64, n: usize) -> Vec<f64> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 33) as f64 / (1u64 << 31) as f64) - 1.0
+            })
+            .collect()
+    }
+
+    /// The inputs the running extraction actually produces, plus the degenerate
+    /// shapes that exercise the guards the fast paths reorganise.
+    fn cases() -> Vec<(&'static str, Vec<f64>)> {
+        let mut out: Vec<(&'static str, Vec<f64>)> = Vec::new();
+        out.push(("random_walk", zscore(lcg(12345, 1000))));
+        out.push(("sine_mix", zscore((0..1000).map(|i| (i as f64 * 0.13).sin() + 0.5 * (i as f64 * 0.031).sin()).collect())));
+
+        // A flat interpolated segment -- the gap-fill case from the handoff's
+        // section 4.2, which is genuinely low-dimensional and is present in the
+        // real corpus. It drives distances toward zero, exercising the
+        // `eps2 == 0.0` and `d > 0.0` branches.
+        let mut gappy = lcg(999, 1000);
+        for i in 300..520 {
+            gappy[i] = 0.0;
+        }
+        out.push(("interpolated_gap", zscore(gappy)));
+
+        // Constant series: every pair distance is exactly zero.
+        out.push(("constant", vec![0.0; 1000]));
+
+        // Short series: trips `k + 1 >= sample_count` in correlation_dimension
+        // and the `m < 2` / narrow-band guards in rosenstein_lye.
+        out.push(("short_30", zscore(lcg(7, 30))));
+        out.push(("short_26", zscore(lcg(8, 26))));
+        out.push(("tiny_6", zscore(lcg(9, 6))));
+        out
+    }
+
+    // The parameters `config_chaos_5hz.json` (and the compiled defaults) use,
+    // which is what the corpus being written right now was extracted with.
+    const TAU: usize = 5;
+    const DIM: usize = 5;
+    const FS: f64 = 5.0;
+    const SLOPE: [f64; 4] = [0.5, 5.0, 5.0, 20.0];
+    const MEAN_PERIOD: f64 = 1.0;
+
+    #[test]
+    fn correlation_dimension_matches_reference_bitwise() {
+        for (name, x) in cases() {
+            let got = correlation_dimension(&x, TAU, DIM);
+            let want = correlation_dimension_ref(&x, TAU, DIM);
+            assert!(same(got, want), "{name}: {got:?} != {want:?}");
+        }
+    }
+
+    #[test]
+    fn rosenstein_matches_reference_bitwise() {
+        for (name, x) in cases() {
+            let got = rosenstein_lye(&x, FS, TAU, DIM, SLOPE, MEAN_PERIOD);
+            let want = rosenstein_lye_ref(&x, FS, TAU, DIM, SLOPE, MEAN_PERIOD);
+            assert!(same(got.0, want.0) && same(got.1, want.1), "{name}: {got:?} != {want:?}");
+        }
+    }
+
+    /// `jmax` is derived from `slope`/`mean_period`/`fs`, so a rate that widens
+    /// the fit window past the 5 Hz default must still agree -- this is the
+    /// check that the truncation is not silently cutting into what the fit reads.
+    #[test]
+    fn rosenstein_truncation_holds_across_rates() {
+        let x = zscore(lcg(2024, 1000));
+        for &(fs, mp) in &[(5.0, 1.0), (10.0, 1.0), (20.0, 1.0), (5.0, 0.5), (5.0, 2.0), (100.0, 1.0)] {
+            let got = rosenstein_lye(&x, fs, TAU, DIM, SLOPE, mp);
+            let want = rosenstein_lye_ref(&x, fs, TAU, DIM, SLOPE, mp);
+            assert!(same(got.0, want.0) && same(got.1, want.1), "fs={fs} mp={mp}: {got:?} != {want:?}");
+        }
+    }
+
+    /// Sweeps embedding parameters away from the defaults, since `tau`/`dim`
+    /// set the exclusion band and the triangular pair count both rewrites index.
+    #[test]
+    fn parity_across_embedding_parameters() {
+        let x = zscore(lcg(555, 600));
+        for tau in 1..=6 {
+            for dim in 2..=6 {
+                let c = correlation_dimension(&x, tau, dim);
+                let cr = correlation_dimension_ref(&x, tau, dim);
+                assert!(same(c, cr), "corrdim tau={tau} dim={dim}: {c:?} != {cr:?}");
+                let r = rosenstein_lye(&x, FS, tau, dim, SLOPE, MEAN_PERIOD);
+                let rr = rosenstein_lye_ref(&x, FS, tau, dim, SLOPE, MEAN_PERIOD);
+                assert!(same(r.0, rr.0) && same(r.1, rr.1), "ros tau={tau} dim={dim}: {r:?} != {rr:?}");
+            }
+        }
+    }
+
+    /// Many independent random series, to catch a boundary the fixed cases miss.
+    #[test]
+    fn parity_over_many_seeds() {
+        for seed in 0..40u64 {
+            let x = zscore(lcg(seed.wrapping_mul(2_654_435_761).wrapping_add(1), 400));
+            let c = correlation_dimension(&x, TAU, DIM);
+            let cr = correlation_dimension_ref(&x, TAU, DIM);
+            assert!(same(c, cr), "corrdim seed={seed}: {c:?} != {cr:?}");
+            let r = rosenstein_lye(&x, FS, TAU, DIM, SLOPE, MEAN_PERIOD);
+            let rr = rosenstein_lye_ref(&x, FS, TAU, DIM, SLOPE, MEAN_PERIOD);
+            assert!(same(r.0, rr.0) && same(r.1, rr.1), "ros seed={seed}: {r:?} != {rr:?}");
+        }
     }
 }
