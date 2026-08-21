@@ -349,20 +349,25 @@ pub fn sample_entropy(data: &[f64], m: usize, r: f64) -> f64 {
     let mut b_count: u64 = 0;
     let mut a_count: u64 = 0;
 
+    // The Chebyshev distance is symmetric and the i == j case is skipped, so
+    // the original ordered double loop visited each unordered pair twice and
+    // got the same answer both times. Walking only j > i and incrementing by
+    // two leaves both counts -- and therefore their ratio -- unchanged, for
+    // half the work.
     for i in 0..l {
-        for j in 0..l {
-            if i == j {
-                continue;
-            }
+        for j in (i + 1)..l {
             let mut dist_m: f64 = 0.0;
             for k in 0..m {
-                dist_m = dist_m.max((data[i + k] - data[j + k]).abs());
+                let d = (data[i + k] - data[j + k]).abs();
+                if d > dist_m {
+                    dist_m = d;
+                }
             }
             if dist_m <= tol {
-                b_count += 1;
+                b_count += 2;
                 let dist_m1 = dist_m.max((data[i + m] - data[j + m]).abs());
                 if dist_m1 <= tol {
-                    a_count += 1;
+                    a_count += 2;
                 }
             }
         }
@@ -387,13 +392,18 @@ pub fn correlation_dimension(x: &[f64], tau: usize, de: usize) -> f64 {
         return 0.0;
     }
 
+    // Row-major embedding, so point `idx` is the contiguous slice
+    // `y[idx * de .. idx * de + de]`. The layout used to be column-major, which
+    // meant reading one point had to gather `de` strided elements into a fresh
+    // `Vec` -- inside a loop that runs once per *pair*, i.e. ~455k allocations
+    // per component per window at the 200 s / 5 Hz configuration.
     let mut y = vec![0.0; de * sample_count];
-    for i in 0..de {
-        for j in 0..sample_count {
-            y[i * sample_count + j] = x[i * tau + j];
+    for j in 0..sample_count {
+        for i in 0..de {
+            y[j * de + i] = x[i * tau + j];
         }
     }
-    let col = |idx: usize| -> Vec<f64> { (0..de).map(|i| y[i * sample_count + idx]).collect() };
+    let point = |idx: usize| -> &[f64] { &y[idx * de..idx * de + de] };
 
     let bins = 200usize;
     let k = de * tau;
@@ -402,20 +412,32 @@ pub fn correlation_dimension(x: &[f64], tau: usize, de: usize) -> f64 {
     }
     let pair_count = sample_count - k - 1;
 
-    let dist_row = |i: usize| -> Vec<f64> {
-        let pi = col(i);
-        (i + k + 1..sample_count)
-            .map(|j| {
-                let pj = col(j);
-                pi.iter().zip(pj.iter()).map(|(&a, &b)| (a - b).powi(2)).sum::<f64>().sqrt()
-            })
-            .collect()
-    };
+    // Every pair distance is used twice: once to find the eps range, once to
+    // bin. Computing them into a flat triangular buffer trades ~3.6 MB per
+    // call for halving the distance work and dropping the per-row allocation.
+    let mut row_start = Vec::with_capacity(pair_count + 1);
+    let mut total = 0usize;
+    for i in 0..pair_count {
+        row_start.push(total);
+        total += sample_count - (i + k + 1);
+    }
+    row_start.push(total);
 
+    let mut dists = vec![0.0f64; total];
     let mut eps1 = 0.0f64;
     let mut eps2 = f64::INFINITY;
     for i in 0..pair_count {
-        for &d in &dist_row(i) {
+        let pi = point(i);
+        let base = row_start[i];
+        for (o, j) in (i + k + 1..sample_count).enumerate() {
+            let pj = point(j);
+            let mut acc = 0.0;
+            for t in 0..de {
+                let d = pi[t] - pj[t];
+                acc += d * d;
+            }
+            let d = acc.sqrt();
+            dists[base + o] = d;
             if d > eps1 {
                 eps1 = d;
             }
@@ -439,7 +461,7 @@ pub fn correlation_dimension(x: &[f64], tau: usize, de: usize) -> f64 {
 
     let mut ci = vec![0.0f64; bins];
     for i in 0..pair_count {
-        let mut sorted = dist_row(i);
+        let sorted = &mut dists[row_start[i]..row_start[i + 1]];
         sorted.sort_by(f64::total_cmp);
         let mut prev_count = 0usize;
         for (b, &e) in epsilon.iter().enumerate() {

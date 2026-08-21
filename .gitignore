@@ -1,2 +1,6 @@
 /target
 data*/
+
+# Symlink farms staged for a run, and run logs.
+bodt_q1_chaos_5hz/
+*_run.log

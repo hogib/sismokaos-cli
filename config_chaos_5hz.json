@@ -1,0 +1,18 @@
+{
+  "station": "BODT",
+  "fs": 5.0,
+  "win_sec": 200,
+  "step_sec": 50,
+  "sta_sec": 0.5,
+  "lta_sec": 60,
+  "freqmin": 0.1,
+  "freqmax": 2.0,
+  "chaos_tau": 5,
+  "chaos_dim": 5,
+  "chaos_evolve": 5,
+  "chaos_min_samples": 500,
+  "chaos_slope_ros": [0.5, 5.0, 5.0, 20.0],
+  "chaos_mean_period": 1.0,
+  "chaos_sampent_m": 2,
+  "chaos_sampent_r": 0.2
+}
